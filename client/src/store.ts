@@ -1,0 +1,492 @@
+import { create } from 'zustand';
+import { CEO_ID, type AgentView, type CeoInfo, type CliView, type HireRequestView, type LogLine, type OfficeUpdateView, type PhoneMessage, type QaView, type RepoView, type ServerEvent, type SwarmSettings, type UsageView, type WorldSnapshot } from '../../shared/types';
+import { blockers } from '../../shared/issues';
+import { chirp, cue } from './ui/sfx';
+import { celebrate } from './world/staffFun';
+
+export type Agent = Omit<AgentView, 'log'>;
+
+export type PhoneTab = 'chat' | 'hires' | 'company' | 'games';
+
+export type Overlay =
+  | { kind: 'terminal'; agentId: string }
+  | { kind: 'kanban'; repoId: string }
+  | { kind: 'app'; repoId: string }
+  | { kind: 'elevator' }
+  | { kind: 'manager'; tab?: ManagerTab; repoId?: string }
+  | { kind: 'phone'; tab?: PhoneTab; requestId?: string }
+  | { kind: 'help' }
+  | { kind: 'staff' };
+
+export type ManagerTab = 'floors' | 'ceo' | 'team' | 'issues' | 'settings';
+
+export interface Focus {
+  id: string;
+  label: string;
+  action: Overlay | { kind: 'hire'; repoId: string; role: 'dev' | 'qa' } | { kind: 'pickup'; toyId: string } | { kind: 'poke'; toyId: string };
+}
+
+/** What the player is carrying. Other items (a blaster, say) join the union with their own kind. */
+export type Held =
+  | { kind: 'ball'; id: string }
+  /** A foam blaster: darts left in the magazine, and performance.now() when a reload started (null when not reloading). */
+  | { kind: 'blaster'; id: string; ammo: number; reloadAt: number | null };
+
+export interface Toast {
+  id: number;
+  level: 'info' | 'success' | 'error';
+  text: string;
+}
+
+interface State {
+  connected: boolean;
+  loaded: boolean;
+  user: string | null;
+  ghReady: boolean;
+  ghError?: string;
+  demo: boolean;
+  workspaceRoot: string;
+  settings: SwarmSettings;
+  clis: CliView[]; // the coding-agent CLIs installed where the office runs
+  repos: RepoView[];
+  agents: Record<string, Agent>;
+  logs: Record<string, LogLine[]>;
+  screens: Record<string, number>; // agentId -> screenshot timestamp (cache buster)
+  qa: Record<string, QaView>; // `${repoId}#${prNumber}`
+  requests: HireRequestView[];
+  ceo: CeoInfo;
+  messages: PhoneMessage[];
+  phoneReadAt: number;
+  officeCommit?: string | null; // undefined: the server can't update itself
+  officeUpdate?: OfficeUpdateView;
+  usage: UsageView; // Claude's subscription usage: normal, pacing after a warning, or paused at the limit
+  restarting: boolean; // the connection dropped because the office is restarting to update
+
+  floor: number; // 0 = lobby
+  travel: { to: number; phase: 'closing' | 'opening' } | null;
+  overlay: Overlay | null;
+  focus: Focus | null;
+  locked: boolean;
+  started: boolean;
+  toasts: Toast[];
+  held: Held | null;
+  /** performance.now() when the player started charging a throw; null when they aren't. */
+  chargeAt: number | null;
+
+  apply(ev: ServerEvent): void;
+  setConnected(v: boolean): void;
+  setRestarting(v: boolean): void;
+  setOfficeUpdate(u: OfficeUpdateView): void;
+  openOverlay(o: Overlay | null): void;
+  setFocus(f: Focus | null): void;
+  /** Pick something up (or swap), or let go of it with null. Always ends a charge. */
+  setHeld(h: Held | null): void;
+  setCharge(at: number | null): void;
+  setLocked(v: boolean): void;
+  start(): void;
+  goToFloor(n: number): void;
+  finishTravel(phase: 'arrived' | 'done'): void;
+  pushToast(level: Toast['level'], text: string): void;
+  dismissToast(id: number): void;
+}
+
+let toastSeq = 1;
+
+// Where the viewer was standing, so a refresh puts them back on the same floor and spot.
+export interface SavedView {
+  floor: number;
+  x: number;
+  z: number;
+  yaw: number;
+  pitch: number;
+}
+const VIEW_KEY = 'cubefarm:view';
+
+export function loadView(): SavedView | null {
+  try {
+    const v = JSON.parse(localStorage.getItem(VIEW_KEY) ?? 'null') as SavedView | null;
+    return v && [v.floor, v.x, v.z, v.yaw, v.pitch].every(Number.isFinite) ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+export function saveView(v: SavedView) {
+  try {
+    localStorage.setItem(VIEW_KEY, JSON.stringify(v));
+  } catch {
+    // storage may be unavailable (private mode); the view just won't be remembered
+  }
+}
+const LOG_KEEP = 600;
+
+export const useStore = create<State>((set, get) => ({
+  connected: false,
+  loaded: false,
+  user: null,
+  ghReady: true,
+  demo: false,
+  workspaceRoot: '',
+  // Until the server's snapshot arrives; setupDone stays true so the wizard doesn't flash while loading.
+  settings: {
+    sessionLimit: 0,
+    defaultModel: 'claude-opus-5-5',
+    defaultEffort: 'medium',
+    runtime: 'terminal',
+    defaultCli: 'claude',
+    hiring: 'approve',
+    teamCap: 6,
+    ceoHeartbeatMin: 60,
+    managerName: '',
+    companyName: '',
+    projectsDir: '',
+    setupDone: true,
+    tutorialStep: -1,
+    pacingSessions: 3,
+  },
+  clis: [],
+  repos: [],
+  agents: {},
+  logs: {},
+  screens: {},
+  qa: {},
+  requests: [],
+  ceo: { queue: [], job: null, lastReviewAt: null, nextReviewAt: null },
+  messages: [],
+  phoneReadAt: 0,
+  usage: { state: 'normal', until: null },
+  restarting: false,
+
+  floor: loadView()?.floor ?? 0,
+  travel: null,
+  overlay: null,
+  focus: null,
+  locked: false,
+  started: false,
+  toasts: [],
+  held: null,
+  chargeAt: null,
+
+  apply(ev) {
+    // Cues compare the old state with the new, so each change sounds once; snapshots (page load,
+    // reconnect) never do, and nothing sounds before the first snapshot.
+    const live = get().loaded;
+    switch (ev.type) {
+      case 'snapshot': {
+        const d: WorldSnapshot = ev.data;
+        const agents: Record<string, Agent> = {};
+        const logs: Record<string, LogLine[]> = {};
+        const screens: Record<string, number> = {};
+        for (const { log, ...a } of d.agents) {
+          agents[a.id] = a;
+          logs[a.id] = log;
+          if (a.screenshotAt) screens[a.id] = a.screenshotAt;
+        }
+        const qa: Record<string, QaView> = {};
+        for (const q of d.qa) qa[qaKey(q.repoId, q.prNumber)] = q;
+        // Stay on the current (or remembered) floor if it still exists; otherwise go to the lobby.
+        const floorExists = d.repos.some((r) => r.floor === get().floor);
+        set({
+          loaded: true,
+          user: d.user,
+          ghReady: d.ghReady,
+          ghError: d.ghError,
+          demo: d.demo,
+          workspaceRoot: d.workspaceRoot,
+          settings: d.settings,
+          repos: d.repos.sort((a, b) => a.floor - b.floor),
+          agents,
+          logs,
+          screens,
+          qa,
+          requests: d.requests,
+          ceo: d.ceo,
+          messages: d.messages,
+          phoneReadAt: d.phoneReadAt,
+          officeCommit: d.officeCommit,
+          officeUpdate: d.officeUpdate,
+          usage: d.usage,
+          clis: d.clis ?? [],
+          restarting: false,
+          floor: floorExists ? get().floor : 0,
+        });
+        break;
+      }
+      case 'repo': {
+        const before = get().repos.find((r) => r.id === ev.repo.id);
+        const wasOpen = new Set(before?.pulls.filter((p) => p.state === 'OPEN').map((p) => p.number));
+        const justMerged = ev.repo.pulls.filter((p) => p.state === 'MERGED' && wasOpen.has(p.number));
+        if (live && justMerged.length) {
+          cue('merged');
+          celebrate(`🎉 PR #${justMerged[0].number} merged! ${justMerged[0].title}`);
+        }
+        const repos = get().repos.filter((r) => r.id !== ev.repo.id);
+        repos.push(ev.repo);
+        set({ repos: repos.sort((a, b) => a.floor - b.floor) });
+        break;
+      }
+      case 'repoRemoved': {
+        const repos = get().repos.filter((r) => r.id !== ev.repoId);
+        const floor = get().floor > repos.length ? 0 : get().floor;
+        set({ repos, floor });
+        break;
+      }
+      case 'agent': {
+        const prev = get().agents[ev.agent.id];
+        if (live && !prev && ev.agent.role !== 'ceo') cue('welcome');
+        if (live && prev && prev.status !== 'error' && ev.agent.status === 'error') cue('error');
+        set({ agents: { ...get().agents, [ev.agent.id]: ev.agent } });
+        break;
+      }
+      case 'agentRemoved': {
+        const { [ev.agentId]: _gone, ...agents } = get().agents;
+        set({ agents });
+        break;
+      }
+      case 'log': {
+        const prev = get().logs[ev.agentId] ?? [];
+        const next = prev.concat(ev.lines);
+        set({ logs: { ...get().logs, [ev.agentId]: next.length > LOG_KEEP ? next.slice(-LOG_KEEP) : next } });
+        break;
+      }
+      case 'screen': {
+        const a = get().agents[ev.agentId];
+        set({
+          screens: { ...get().screens, [ev.agentId]: ev.at },
+          agents: a ? { ...get().agents, [ev.agentId]: { ...a, hasScreenshot: true, screenshotAt: ev.at, browserUrl: ev.url ?? a.browserUrl } } : get().agents,
+        });
+        break;
+      }
+      case 'qa': {
+        const prev = get().qa[qaKey(ev.qa.repoId, ev.qa.prNumber)]?.status;
+        const failed = (st?: QaView['status']) => st === 'failed' || st === 'needs-human';
+        if (live && ev.qa.status === 'passed' && prev !== 'passed') cue('ready');
+        if (live && failed(ev.qa.status) && !failed(prev)) cue('qaFailed');
+        set({ qa: { ...get().qa, [qaKey(ev.qa.repoId, ev.qa.prNumber)]: ev.qa } });
+        break;
+      }
+      case 'qaRemoved': {
+        const { [qaKey(ev.repoId, ev.prNumber)]: _gone, ...qa } = get().qa;
+        set({ qa });
+        break;
+      }
+      case 'settings':
+        set({ settings: ev.settings });
+        break;
+      case 'clis':
+        set({ clis: ev.clis });
+        break;
+      case 'request': {
+        const prev = get().requests.find((r) => r.id === ev.request.id);
+        if (live && ev.request.kind === 'hire' && ev.request.status === 'approved' && prev?.status === 'pending') cue('welcome');
+        const requests = get().requests.filter((r) => r.id !== ev.request.id);
+        requests.push(ev.request);
+        set({ requests: requests.sort((a, b) => a.createdAt - b.createdAt) });
+        break;
+      }
+      case 'ceo':
+        set({ ceo: ev.ceo });
+        break;
+      case 'message': {
+        set({ messages: [...get().messages.slice(-199), ev.message] });
+        const o = get().overlay;
+        const reading = o?.kind === 'phone' && (o.tab ?? 'chat') === 'chat';
+        if (ev.message.from === 'ceo' && !reading) {
+          chirp();
+          const ceo = get().agents[CEO_ID]?.name ?? 'CEO';
+          const text = ev.message.text.replace(/\s+/g, ' ');
+          get().pushToast('info', `📱 ${ceo}: ${text.length > 110 ? `${text.slice(0, 109)}…` : text}`);
+        }
+        break;
+      }
+      case 'phoneRead':
+        set({ phoneReadAt: Math.max(get().phoneReadAt, ev.at) });
+        break;
+      case 'toast':
+        get().pushToast(ev.level, ev.text);
+        break;
+      case 'officeUpdate':
+        set({ officeUpdate: ev.officeUpdate });
+        break;
+      case 'usage':
+        set({ usage: ev.usage });
+        break;
+    }
+  },
+
+  setConnected: (connected) => set({ connected }),
+  setRestarting: (restarting) => set({ restarting }),
+  setOfficeUpdate: (officeUpdate) => set({ officeUpdate }),
+  openOverlay(overlay) {
+    // Opening any panel drops whatever you're carrying, so nothing is left floating behind it.
+    set(overlay ? { overlay, focus: null, held: null, chargeAt: null } : { overlay });
+    if (overlay && document.pointerLockElement) document.exitPointerLock();
+  },
+  setFocus: (focus) => {
+    const cur = get().focus;
+    if (cur?.id === focus?.id && cur?.label === focus?.label) return;
+    set({ focus });
+  },
+  setHeld: (held) => set({ held, chargeAt: null }),
+  setCharge: (chargeAt) => set({ chargeAt }),
+  setLocked: (locked) => set({ locked }),
+  start: () => set({ started: true }),
+  goToFloor(n) {
+    if (n === get().floor || get().travel) {
+      set({ overlay: null });
+      return;
+    }
+    set({ overlay: null, held: null, chargeAt: null, travel: { to: n, phase: 'closing' } });
+  },
+  finishTravel(phase) {
+    const t = get().travel;
+    if (!t) return;
+    if (phase === 'arrived') set({ floor: t.to, travel: { ...t, phase: 'opening' } });
+    else set({ travel: null });
+  },
+  pushToast(level, text) {
+    const id = toastSeq++;
+    set({ toasts: [...get().toasts.slice(-4), { id, level, text }] });
+    setTimeout(() => get().dismissToast(id), level === 'error' ? 9000 : 5000);
+  },
+  dismissToast: (id) => set({ toasts: get().toasts.filter((t) => t.id !== id) }),
+}));
+
+// ---------- derived helpers ----------
+
+export const qaKey = (repoId: string, prNumber: number) => `${repoId}#${prNumber}`;
+
+export const repoOnFloor = (repos: RepoView[], floor: number) => repos.find((r) => r.floor === floor) ?? null;
+
+export const agentsOnRepo = (agents: Record<string, Agent>, repoId: string) =>
+  Object.values(agents)
+    .filter((a) => a.repoId === repoId)
+    .sort((a, b) => (a.role === b.role ? a.desk - b.desk : a.role === 'dev' ? -1 : 1));
+
+/**
+ * Panels that hide the whole office (the wide ones: Kanban, terminals and the manager's console), so the
+ * 3D view can stop drawing behind them. The phone, help, elevator panel and confirm dialogs are see-through.
+ */
+export const coversView = (o: Overlay | null) => o?.kind === 'kanban' || o?.kind === 'terminal' || o?.kind === 'manager';
+
+export const isBusy = (a: Agent) => a.status === 'preparing' || a.status === 'working';
+
+/** CEO messages the manager hasn't seen yet (proposals are counted by pendingRequests instead). */
+export const unreadMessages = (messages: PhoneMessage[], readAt: number) => messages.filter((m) => m.from === 'ceo' && !m.requestId && m.at > readAt).length;
+
+export const pendingRequests = (requests: HireRequestView[]) => requests.filter((r) => r.status === 'pending');
+
+/** The red dot on the phone: decisions waiting on the manager plus unread messages. */
+export function usePhoneBadge() {
+  const requests = useStore((s) => s.requests);
+  const messages = useStore((s) => s.messages);
+  const readAt = useStore((s) => s.phoneReadAt);
+  return pendingRequests(requests).length + unreadMessages(messages, readAt);
+}
+
+export interface KanbanCard {
+  key: string;
+  number: number;
+  title: string;
+  url?: string;
+  agent?: Agent;
+  note?: string;
+  tone?: 'warn' | 'bad' | 'good';
+  prNumber?: number;
+  qa?: QaView;
+}
+
+export interface KanbanColumns {
+  backlog: KanbanCard[];
+  progress: KanbanCard[];
+  qa: KanbanCard[];
+  ready: KanbanCard[];
+  merged: KanbanCard[];
+}
+
+/** Sort a floor's GitHub state and QA pipeline into the five office Kanban columns. */
+export function kanbanFor(repo: RepoView, agents: Agent[], qaRecords: Record<string, QaView>): KanbanColumns {
+  const openPulls = repo.pulls.filter((p) => p.state === 'OPEN');
+  const byId = new Map(agents.map((a) => [a.id, a]));
+  const devs = agents.filter((a) => a.role === 'dev');
+  const authorOf = (n: number, head: string) => devs.find((a) => a.prNumber === n) ?? devs.find((a) => a.branch && a.branch === head);
+
+  const progress: KanbanCard[] = [];
+  for (const a of devs) {
+    if (a.issueNumber == null || a.task !== 'issue' || a.status === 'idle') continue;
+    if (a.prNumber != null && openPulls.some((p) => p.number === a.prNumber)) continue;
+    const note =
+      a.status === 'preparing' ? 'setting up' : a.status === 'working' ? 'working' : a.status === 'error' ? 'needs help' : a.status === 'stopped' ? 'stopped' : 'finished · no PR';
+    progress.push({
+      key: `a-${a.id}`,
+      number: a.issueNumber,
+      title: a.issueTitle ?? '',
+      agent: a,
+      note,
+      tone: a.status === 'error' ? 'bad' : a.status === 'stopped' || a.status === 'done' ? 'warn' : undefined,
+    });
+  }
+
+  const qa: KanbanCard[] = [];
+  const ready: KanbanCard[] = [];
+  for (const p of openPulls) {
+    const rec = qaRecords[qaKey(repo.id, p.number)];
+    const dev = (rec?.devAgentId ? byId.get(rec.devAgentId) : undefined) ?? authorOf(p.number, p.headRefName);
+    const tester = rec?.qaAgentId ? byId.get(rec.qaAgentId) : undefined;
+    const base = { key: `pr-${p.number}`, number: p.number, prNumber: p.number, title: p.title, url: p.url, qa: rec };
+    if (rec?.status === 'passed') {
+      ready.push({
+        ...base,
+        agent: dev,
+        note: rec.mergeNote
+          ? `QA ✓ · ${rec.mergeNote}`
+          : p.mergeable === 'CONFLICTING'
+            ? 'QA ✓ · conflicts'
+            : p.checks === 'failing'
+              ? 'QA ✓ · CI failing'
+              : repo.autoMerge && p.checks === 'pending'
+                ? 'QA ✓ · waiting for checks'
+                : '✅ QA passed',
+        tone: p.mergeable === 'CONFLICTING' || p.checks === 'failing' ? 'warn' : 'good',
+      });
+      continue;
+    }
+    const status = rec?.status;
+    qa.push({
+      ...base,
+      agent: status === 'testing' ? tester : dev,
+      note:
+        status === 'queued'
+          ? `waiting for QA${rec && rec.round > 1 ? ` · round ${rec.round}` : ''}`
+          : status === 'testing'
+            ? `🔍 testing · round ${rec!.round}`
+            : status === 'failed'
+              ? '❌ failed · back to dev'
+              : status === 'fixing'
+                ? `🔧 fixing · round ${rec!.round}`
+                : status === 'needs-human'
+                  ? '⚠️ needs you'
+                  : p.isDraft
+                    ? 'draft'
+                    : 'not tested yet',
+      tone: status === 'failed' || status === 'needs-human' ? 'bad' : status === 'fixing' || !status ? 'warn' : undefined,
+    });
+  }
+
+  const claimed = new Set<number>([...progress.map((c) => c.number), ...openPulls.flatMap((p) => p.closesIssues)]);
+  const open = new Set(repo.issues.map((i) => i.number));
+  const backlog: KanbanCard[] = repo.issues
+    .filter((i) => !claimed.has(i.number))
+    .map((i) => {
+      const waits = blockers(i.body, open);
+      const labels = i.labels.map((l) => l.replace(/^swarm:/i, '🎯 ')).slice(0, 2).join(', ');
+      return { key: `i-${i.number}`, number: i.number, title: i.title, url: i.url, note: waits.length ? `⏳ after #${waits.join(', #')}` : labels || undefined };
+    });
+
+  const merged: KanbanCard[] = repo.pulls
+    .filter((p) => p.state === 'MERGED')
+    .sort((a, b) => (b.mergedAt ?? '').localeCompare(a.mergedAt ?? ''))
+    .map((p) => ({ key: `m-${p.number}`, number: p.number, prNumber: p.number, title: p.title, url: p.url, agent: authorOf(p.number, p.headRefName) }));
+
+  return { backlog, progress, qa, ready, merged };
+}
