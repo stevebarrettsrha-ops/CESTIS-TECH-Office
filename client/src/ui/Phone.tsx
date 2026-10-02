@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../api';
 import { isBusy, pendingRequests, qaKey, unreadMessages, useStore, type PhoneTab } from '../store';
-import { CEO_ID, type HireRequestView, type PhoneMessage } from '../../../shared/types';
+import { CEO_ID, type HireRequestView, type MetricsView, type PhoneMessage } from '../../../shared/types';
 import { Markdown } from './Markdown';
 import { MessageBox } from './MessageBox';
 import { closeOverlay } from './Overlays';
@@ -323,8 +323,52 @@ function useCompany() {
   }, [repos, agents, qa, requests, settings, info]);
 }
 
+// ---------- productivity ----------
+
+const duration = (min: number) => {
+  if (min < 60) return `${Math.max(1, Math.round(min))}m`;
+  const h = Math.floor(min / 60);
+  if (h < 24) return `${h}h ${Math.round(min % 60)}m`;
+  return `${Math.floor(h / 24)}d ${h % 24}h`;
+};
+const percent = (x: number | null) => (x == null ? '–' : `${Math.round(x * 100)}%`);
+
+/** The week's numbers from the office's work log: throughput, cycle time, QA pass rate, cost and how busy the staff are. */
+function Productivity({ m }: { m: MetricsView }) {
+  const w = m.week;
+  const tiles: [string, string | number, string][] = [
+    ['🎉', w.merged, `merged this week (${m.day.merged} today)`],
+    ['📈', m.perDay ?? '–', 'merged per day'],
+    ['⏱', w.medianCycleMin == null ? '–' : duration(w.medianCycleMin), 'issue → merged (median)'],
+    ['🔍', percent(w.qaPassRate), `of ${w.qaRounds} QA round${w.qaRounds === 1 ? '' : 's'} passed`],
+    ['💵', w.costPerMerged == null ? '–' : `$${w.costPerMerged.toFixed(2)}`, 'cost per merged PR'],
+    ['🪑', percent(w.utilization), 'staff time busy'],
+  ];
+  return (
+    <>
+      <h3 className="phone-h">This week</h3>
+      <div className="tiles">
+        {tiles.map(([icon, value, label]) => (
+          <div key={icon} className="tile">
+            <div className="tile-value">
+              {icon} {value}
+            </div>
+            <div className="tile-label">{label}</div>
+          </div>
+        ))}
+      </div>
+      <div className="muted small productivity-note">
+        {m.since == null
+          ? 'These fill in as the team finishes work.'
+          : `From the office's work log since ${new Date(m.since).toLocaleDateString()}${w.avgQaRounds != null ? ` · ${w.avgQaRounds} QA rounds per merged PR` : ''} · $${w.costUsd.toFixed(2)} spent, CEO included.`}
+      </div>
+    </>
+  );
+}
+
 function Company() {
   const c = useCompany();
+  const metrics = useStore((s) => s.metrics);
   const goToFloor = useStore((s) => s.goToFloor);
   const tiles: [string, string | number, string][] = [
     ['🏢', c.floors.length, c.floors.length === 1 ? 'project' : 'projects'],
@@ -354,6 +398,7 @@ function Company() {
           </li>
         ))}
       </ul>
+      {metrics && c.floors.length > 0 && <Productivity m={metrics} />}
       {c.floors.length > 0 && <h3 className="phone-h">Projects</h3>}
       {c.floors.map((f) => (
         <div key={f.repo.id} className="proj" style={{ ['--accent' as string]: f.repo.color }}>

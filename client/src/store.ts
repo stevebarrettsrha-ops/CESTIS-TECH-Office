@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { CEO_ID, type AgentView, type CeoInfo, type CliView, type HireRequestView, type LogLine, type OfficeUpdateView, type PhoneMessage, type QaView, type RepoView, type ServerEvent, type SwarmSettings, type UsageView, type WorldSnapshot } from '../../shared/types';
+import { CEO_ID, type AgentView, type CeoInfo, type CliView, type HireRequestView, type LogLine, type MetricsView, type OfficeUpdateView, type PhoneMessage, type QaView, type RepoView, type ServerEvent, type SwarmSettings, type UsageView, type WorldSnapshot } from '../../shared/types';
 import { blockers } from '../../shared/issues';
 import { chirp, cue } from './ui/sfx';
 import { celebrate } from './world/staffFun';
@@ -60,6 +60,7 @@ interface State {
   officeCommit?: string | null; // undefined: the server can't update itself
   officeUpdate?: OfficeUpdateView;
   usage: UsageView; // Claude's subscription usage: normal, pacing after a warning, or paused at the limit
+  metrics: MetricsView | null; // productivity from the office's work log (null until the first snapshot)
   restarting: boolean; // the connection dropped because the office is restarting to update
 
   floor: number; // 0 = lobby
@@ -155,6 +156,7 @@ export const useStore = create<State>((set, get) => ({
   messages: [],
   phoneReadAt: 0,
   usage: { state: 'normal', until: null },
+  metrics: null,
   restarting: false,
 
   floor: loadView()?.floor ?? 0,
@@ -206,6 +208,7 @@ export const useStore = create<State>((set, get) => ({
           officeCommit: d.officeCommit,
           officeUpdate: d.officeUpdate,
           usage: d.usage,
+          metrics: d.metrics ?? null,
           clis: d.clis ?? [],
           restarting: false,
           floor: floorExists ? get().floor : 0,
@@ -310,6 +313,9 @@ export const useStore = create<State>((set, get) => ({
         break;
       case 'usage':
         set({ usage: ev.usage });
+        break;
+      case 'metrics':
+        set({ metrics: ev.metrics });
         break;
     }
   },

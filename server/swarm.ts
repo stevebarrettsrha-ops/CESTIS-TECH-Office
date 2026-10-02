@@ -5,7 +5,7 @@ import type { WebSocket } from 'ws';
 import type { Backend } from './backend.ts';
 import type { LogEntry, SessionHandle, SessionResult } from './agentRunner.ts';
 import type { PrDetails } from './github.ts';
-import { defaultProjectsDir, HOME_DIR, LOG_BUFFER, SCHEDULER_INTERVAL_MS, STATE_FILE, SYNC_INTERVAL_MS, WORKSPACE_ROOT } from './config.ts';
+import { defaultProjectsDir, EVENTS_FILE, HOME_DIR, LOG_BUFFER, SCHEDULER_INTERVAL_MS, STATE_FILE, SYNC_INTERVAL_MS, WORKSPACE_ROOT } from './config.ts';
 import { ceoJobPrompt, ceoSystemPrompt, createOfficeTools, IssueCap, jobLabel, planRoute, specialtyLabel, specialtySlug, type CeoJob, type OfficeTools } from './ceo.ts';
 import { HttpError } from './httpError.ts';
 import { CHECKS_ALERT_MS, MAX_MERGE_FIXES, MERGE_RETRY_MS, mergeStep } from './mergeGate.ts';
@@ -13,6 +13,8 @@ import { DEFAULT_PREVIEW, Previews, parsePreviewPatch } from './previews.ts';
 import { drainDecision, lastUpdateMessage, POSTPONE_MS, type DrainInput, type LastUpdate } from './officeUpdate.ts';
 import { clampPacingSessions, DEFAULT_PACING_SESSIONS, mayStart, PACING_MS, pacingMessage, usageLabel, usageView, type UsageWarning, type WorkKind } from './pacing.ts';
 import { isCli } from './clis.ts';
+import { metricsView, WorkLog, type WorkEvent } from './metrics.ts';
+import { STOPPED_RELEASE_MS, stoppedDue } from './stopped.ts';
 import { AgentTerminal } from './terminal.ts';
 import { blockers, holdUps, issueSpecialty } from '../shared/issues.ts';
 import { effectiveModel } from '../shared/models.ts';
@@ -31,6 +33,7 @@ import type {
   HireRequestView,
   IssueInfo,
   LogLine,
+  MetricsView,
   OfficeUpdateView,
   PhoneMessage,
   PreviewConfig,
@@ -106,6 +109,7 @@ interface PersistedAgent {
 /** A pull request's trip through QA. */
 interface QaRecord extends QaView {
   issueNumber: number | null;
+  authorId: string | null; // the developer who opened it (devAgentId moves to whoever fixes it)
   devSessionId: string | null; // the dev's Claude Code session, resumed to fix QA findings
   fixInstructions: string | null;
   sessionFailures: number;
@@ -415,6 +419,9 @@ export class Swarm {
   };
   private lastOfficeView = '';
   private clis: CliView[] = []; // coding-agent CLIs found on this machine (detected at startup)
+  private work = new WorkLog(EVENTS_FILE); // the history the productivity numbers come from
+  private metricsTimer: NodeJS.Timeout | null = null;
+  private stoppedSince = new Map<string, number>(); // agent id → when it was first seen stopped (see stopped.ts)
 
   constructor(private backend: Backend) {
     this.previews = new Previews(backend, {
@@ -429,6 +436,7 @@ export class Swarm {
   // ---------- lifecycle ----------
 
   async init() {
+    await this.work.load().catch((err) => console.warn('could not read the work log', err));
     try {
       const raw = await fs.readFile(STATE_FILE, 'utf8');
       const loaded = JSON.parse(raw) as Partial<Persisted>;
@@ -459,6 +467,7 @@ export class Swarm {
         })),
         qa: (loaded.qa ?? []).map((q) => ({
           ...q,
+          authorId: q.authorId ?? q.devAgentId ?? null,
           testedSha: q.testedSha ?? null,
           passedSha: q.passedSha ?? null,
           fixReason: q.fixReason ?? null,
@@ -589,7 +598,7 @@ export class Swarm {
         this.clearTask(a);
         continue;
       }
-      if (this.slotsFull()) continue; // stays 'stopped'; the manager can resume it later
+      if (this.slotsFull()) continue; // stays 'stopped': the manager can resume it, or it goes back to the pool (stopped.ts)
       void this.message(a.id, 'The office server restarted while you were working. Check the state of your worktree and continue where you left off.').catch((err) =>
         console.warn(`could not resume ${a.name}`, err),
       );
@@ -702,6 +711,7 @@ export class Swarm {
       messages: this.state.messages.slice(-100),
       phoneReadAt: this.state.phoneReadAt,
       usage: this.usageNow(),
+      metrics: this.metricsNow(),
       clis: this.clis,
       officeCommit: this.officeHead?.slice(0, 7) ?? null,
       officeUpdate: this.officeHead ? this.officeUpdateView() : undefined,
@@ -735,6 +745,22 @@ export class Swarm {
 
   private emitRepo(r: PersistedRepo) {
     this.broadcast({ type: 'repo', repo: this.repoView(r) });
+  }
+
+  // ---------- work log ----------
+
+  /** Log what happened to a piece of work, and refresh the productivity numbers shortly after. */
+  private record(e: WorkEvent) {
+    this.work.add(e);
+    if (this.metricsTimer) return;
+    this.metricsTimer = setTimeout(() => {
+      this.metricsTimer = null;
+      this.broadcast({ type: 'metrics', metrics: this.metricsNow() });
+    }, 2000);
+  }
+
+  private metricsNow(): MetricsView {
+    return metricsView(this.work.events, Date.now(), this.state.agents.filter((a) => a.role !== 'ceo').length);
   }
 
   private emitAgent(a: PersistedAgent) {
@@ -1129,6 +1155,7 @@ export class Swarm {
    */
   async shutdown(restart = false): Promise<void> {
     await this.writeState().catch((err) => console.warn('could not save the state', err));
+    await this.work.flush();
     await this.backend.releaseClis(restart); // before the terminals are saved: whatever they print next waits in the keeper
     await this.saveTerminals(true);
     await this.previews.stopAll(this.state.repos);
@@ -1184,6 +1211,33 @@ export class Swarm {
 
   /** Keep agents and QA records in step with what happened to PRs on GitHub. */
   private reconcilePulls(repo: PersistedRepo, pulls: PullInfo[]) {
+    // A merge seen for the first time: log it and credit everyone who helped, once each. Credit comes from the QA
+    // record as well as the developer's desk, since a developer has usually moved on to another issue by now.
+    for (const pr of pulls) {
+      if (pr.state !== 'MERGED' || this.work.hasMerged(repo.id, pr.number)) continue;
+      const rec = this.state.qa.find((q) => q.repoId === repo.id && q.prNumber === pr.number);
+      const holders = this.state.agents.filter((a) => a.repoId === repo.id && a.role === 'dev' && a.task !== 'qa' && a.prNumber === pr.number);
+      if (!rec && holders.length === 0) continue; // not the office's work
+      const ids = new Set([...holders.map((a) => a.id), rec?.authorId, rec?.devAgentId, rec?.qaAgentId].filter((id): id is string => !!id));
+      const credited = this.state.agents.filter((a) => ids.has(a.id));
+      for (const a of credited) {
+        a.merged = (a.merged ?? 0) + 1;
+        this.emitAgent(a);
+      }
+      const time = (iso: string | null) => (iso && Number.isFinite(Date.parse(iso)) ? Date.parse(iso) : null);
+      this.record({
+        at: time(pr.mergedAt) ?? Date.now(),
+        kind: 'merged',
+        repoId: repo.id,
+        pr: pr.number,
+        issue: rec?.issueNumber ?? holders[0]?.issueNumber ?? pr.closesIssues[0] ?? null,
+        credited: credited.map((a) => a.id),
+        qaRounds: rec?.round ?? 0,
+        mergeFixes: rec?.mergeFixes ?? 0,
+        openedAt: time(pr.createdAt),
+      });
+    }
+
     for (const a of this.state.agents) {
       if (a.repoId !== repo.id || a.role !== 'dev' || a.prNumber == null || BUSY.includes(a.status) || a.status === 'idle') continue;
       const pr = pulls.find((p) => p.number === a.prNumber);
@@ -1193,7 +1247,6 @@ export class Swarm {
         continue;
       }
       this.appendLog(a, [{ kind: 'done', text: pr.state === 'MERGED' ? `🎉 PR #${pr.number} was merged. Ready for the next issue.` : `PR #${pr.number} was closed without merging.` }]);
-      if (pr.state === 'MERGED') a.merged = (a.merged ?? 0) + 1;
       this.clearTask(a);
     }
 
@@ -1201,11 +1254,6 @@ export class Swarm {
     for (const q of this.state.qa.filter((x) => x.repoId === repo.id)) {
       const pr = pulls.find((p) => p.number === q.prNumber);
       if (pr && pr.state !== 'OPEN' && q.status !== 'testing' && q.status !== 'fixing') {
-        const tester = pr.state === 'MERGED' && q.qaAgentId ? this.state.agents.find((x) => x.id === q.qaAgentId) : undefined;
-        if (tester) {
-          tester.merged = (tester.merged ?? 0) + 1;
-          this.emitAgent(tester);
-        }
         this.state.qa = this.state.qa.filter((x) => x !== q);
         this.broadcast({ type: 'qaRemoved', repoId: repo.id, prNumber: q.prNumber });
       }
@@ -1428,14 +1476,35 @@ export class Swarm {
   resetAgent(id: string) {
     const a = this.agent(id);
     if (BUSY.includes(a.status)) throw new HttpError(409, `${a.name} is busy; stop them first`);
+    this.clearDesk(a, '↺ Cleared desk. Ready for new work.');
+  }
+
+  /** Drop an agent's task (and hand back any QA work it held) so it can take new work. */
+  private clearDesk(a: PersistedAgent, note: string) {
     for (const q of this.state.qa) {
-      if (q.qaAgentId === id && q.status === 'testing') this.setQa(q, { status: 'queued', qaAgentId: null });
-      if (q.devAgentId === id && q.status === 'fixing') this.setQa(q, { status: 'failed' });
+      if (q.qaAgentId === a.id && q.status === 'testing') this.setQa(q, { status: 'queued', qaAgentId: null });
+      if (q.devAgentId === a.id && q.status === 'fixing') this.setQa(q, { status: 'failed' });
     }
-    this.agentRt.get(id)?.terminal?.releaseIdle?.();
+    this.agentRt.get(a.id)?.terminal?.releaseIdle?.();
     this.clearTask(a);
-    this.appendLog(a, [{ kind: 'system', text: '↺ Cleared desk. Ready for new work.' }]);
+    this.appendLog(a, [{ kind: 'system', text: note }]);
     this.save();
+  }
+
+  /** Agents stopped for a while go back to the pool and let go of their issue (stopped.ts). */
+  private releaseStopped() {
+    const staff = this.state.agents.filter((a) => a.role !== 'ceo');
+    const candidates = staff.map((a) => ({ id: a.id, stopped: a.status === 'stopped', session: !!this.agentRt.get(a.id)?.session }));
+    const due = stoppedDue(candidates, this.stoppedSince, Date.now());
+    if (due.length === 0) return;
+    const minutes = Math.round(STOPPED_RELEASE_MS / 60_000);
+    const names: string[] = [];
+    for (const a of staff.filter((x) => due.includes(x.id))) {
+      const held = a.issueNumber ? ` Let go of #${a.issueNumber}.` : '';
+      this.clearDesk(a, `↺ Stopped for ${minutes} minutes, so back in the pool for new work.${held}`);
+      names.push(a.name);
+    }
+    this.postMessage('office', `↺ ${names.join(', ')} had been stopped for ${minutes} minutes and ${names.length === 1 ? 'is' : 'are'} back in the pool for new work.`);
   }
 
   private issueTaken(repo: PersistedRepo, n: number) {
@@ -1584,6 +1653,7 @@ export class Swarm {
     rt.browserUrl = null;
     rt.shots = [];
     void removeScreens(a.id);
+    if (a.task) this.record({ at: a.startedAt!, kind: 'start', repoId: a.repoId, agentId: a.id, task: a.task, issue: a.issueNumber, pr: a.prNumber });
     this.appendLog(a, [
       { kind: 'system', text: '' },
       { kind: 'system', text: `━━━ ${banner} ━━━` },
@@ -1711,6 +1781,7 @@ export class Swarm {
     a.endedAt = Date.now();
     a.costUsd += result.costUsd;
     a.turns += result.turns;
+    this.recordSession(a, result);
     // Dev servers the agent forgot to stop would otherwise keep its port and lock its desk folder.
     void this.backend.releaseDesk(repo.fullName, this.agentSlug(a), this.port(a)).catch(() => undefined);
     if (result.interrupted) this.interrupted(a);
@@ -1723,6 +1794,11 @@ export class Swarm {
     this.save();
     void this.syncRepo(repo.id);
     setTimeout(() => this.schedule(), 500);
+  }
+
+  private recordSession(a: PersistedAgent, result: SessionResult) {
+    const ms = a.startedAt && a.endedAt ? Math.max(0, a.endedAt - a.startedAt) : 0;
+    this.record({ at: a.endedAt ?? Date.now(), kind: 'session', repoId: a.repoId, agentId: a.id, task: a.task, ms, costUsd: result.costUsd, ok: result.ok });
   }
 
   private minutes(a: PersistedAgent) {
@@ -1808,6 +1884,7 @@ export class Swarm {
         commentUrl: null,
         updatedAt: Date.now(),
         issueNumber,
+        authorId: dev?.id ?? null,
         devSessionId: dev && dev.prNumber === prNumber ? dev.sessionId : null,
         fixInstructions: null,
         sessionFailures: 0,
@@ -1969,6 +2046,7 @@ export class Swarm {
       } catch (err) {
         this.appendLog(a, [{ kind: 'error', text: `  ⎿ Could not post the QA report: ${(err as Error).message}` }]);
       }
+      this.record({ at: Date.now(), kind: 'verdict', repoId: repo.id, agentId: a.id, pr: rec.prNumber, round: rec.round, pass });
       const qaRounds = rec.round - rec.retests; // rounds QA itself asked for
       const nextStatus = pass ? 'passed' : qaRounds >= MAX_QA_ROUNDS ? 'needs-human' : 'failed';
       this.setQa(rec, {
@@ -2362,6 +2440,7 @@ export class Swarm {
    */
   private schedule() {
     this.tickUsage();
+    this.releaseStopped();
     if (this.officeUpdateTick()) return; // draining for the office's own update
     if (this.limited()) return;
     // Management first: the CEO's jobs are short and shape everyone else's work.
@@ -2716,6 +2795,7 @@ export class Swarm {
     a.endedAt = Date.now();
     a.costUsd += result.costUsd;
     a.turns += result.turns;
+    this.recordSession(a, result);
     const job = this.state.ceo.job;
     this.state.ceo.job = null;
     if (result.interrupted) this.interrupted(a);

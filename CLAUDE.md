@@ -88,6 +88,9 @@ Server (`server/`, Node + Express 5 + ws, run by tsx in development; esbuild bun
 - `httpError.ts`: `HttpError(status, message)`.
 - `officeUpdate.ts`: the office's self-update: the drain decision, the launcher contract (IPC, `last-update.json`).
 - `pacing.ts`: pacing new work after Claude's usage warnings: the start/skip decision and the usage state.
+- `metrics.ts`: the work log (`<SWARM_HOME>/events.jsonl`: tasks started, sessions, QA verdicts, merges) and the
+  productivity numbers computed from it (`MetricsView`: throughput, cycle time, QA pass rate, cost, utilization).
+- `stopped.ts`: when an agent left `stopped` goes back to the pool (after `STOPPED_RELEASE_MS`) and lets go of its issue.
 
 The `cestis-office` command (`bin/cestis-office.js`, plain JS): checks Node/git/gh/Claude login, starts `dist-server/index.js`,
 opens the browser; `login` and `doctor` subcommands.

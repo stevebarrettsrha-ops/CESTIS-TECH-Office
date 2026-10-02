@@ -12,6 +12,8 @@ export const HOME_DIR = process.env.SWARM_HOME ?? path.join(os.homedir(), '.cest
 export const WORKSPACE_ROOT = path.join(HOME_DIR, 'workspaces');
 export const DEMO = process.argv.includes('--demo') || process.env.SWARM_DEMO === '1' || process.env.SWARM_DEMO === 'true';
 export const STATE_FILE = path.join(HOME_DIR, DEMO ? 'demo-state.json' : 'state.json');
+// The work log the productivity numbers come from (server/metrics.ts).
+export const EVENTS_FILE = path.join(HOME_DIR, DEMO ? 'demo-events.jsonl' : 'events.jsonl');
 
 // How often each connected repo's issues and PRs are refreshed from GitHub.
 export const SYNC_INTERVAL_MS = 45_000;

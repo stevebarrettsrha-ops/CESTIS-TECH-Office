@@ -35,6 +35,20 @@ PRs opened by people, not agents, show up under **In QA** as "not tested yet", w
 
 You can message an agent at any time. While they're working, the message is injected into their live session. After a developer finishes, the message resumes their session, e.g. "the CI failed, please fix the lint errors".
 
+An agent you stop (or interrupt with Esc in their terminal, or one the office stopped for a restart or an update) keeps its task for 30 minutes, so you can carry on in their terminal or message them. After that it goes back to the pool for new work and lets go of its issue, and your phone says so.
+
+## Productivity
+
+The phone's **Company** tab shows the week at a glance:
+
+- **Merged**: how many pull requests merged this week and today, and the daily rate.
+- **Issue → merged**: the median time from an agent picking an issue up to its pull request merging.
+- **QA pass rate**: the share of QA rounds that passed, and how many rounds each merged pull request took.
+- **Cost per merged PR**: the session cost the agents reported (CEO included), divided by the merges.
+- **Staff time busy**: developer and QA session time over the staff's hours.
+
+The numbers come from the office's work log, `events.jsonl`, which keeps 30 days. Every merge also counts towards the Employee of the Month for each person who helped: the developer who opened it, whoever fixed it and the QA tester.
+
 ## QA testers
 
 - Every floor always has at least one QA tester: one is hired when a repo is connected, and the last one can't be let go. You can hire up to 3 per floor (manager's console → Team, or press `E` on an empty QA station).
@@ -73,6 +87,7 @@ Agents can do anything your own coding agent in a terminal can. Run the office w
 ## Where things live
 
 - `~/.cestis-office/state.json`: floors, agents, settings and terminal history (`SWARM_HOME` overrides the folder)
+- `~/.cestis-office/events.jsonl`: the work log behind the productivity numbers (the last 30 days)
 - `~/.cestis-office/terminals/<agent>.ansi`: each agent's terminal screen and scrollback
 - `~/.cestis-office/sessions/<token>/`: a running CLI session's settings, MCP config and instructions (removed when it ends); `~/.cestis-office/bin/`: the small scripts the CLIs call back to the office with
 - `~/.cestis-office/workspaces/<owner>__<repo>/main`: a clone of each repo
