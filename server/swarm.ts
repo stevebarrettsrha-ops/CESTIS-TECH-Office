@@ -16,6 +16,7 @@ import { isCli } from './clis.ts';
 import { metricsView, WorkLog, type WorkEvent } from './metrics.ts';
 import { STOPPED_RELEASE_MS, stoppedDue } from './stopped.ts';
 import { STALL_STOP_MS, STALL_WARN_MS, stallAction } from './watchdog.ts';
+import { retestBrief } from './rework.ts';
 import { AgentTerminal } from './terminal.ts';
 import { blockers, holdUps, issueSpecialty } from '../shared/issues.ts';
 import { effectiveModel } from '../shared/models.ts';
@@ -115,6 +116,7 @@ interface QaRecord extends QaView {
   fixInstructions: string | null;
   sessionFailures: number;
   testedSha: string | null; // the head commit QA is testing
+  checkedSha: string | null; // the head QA last gave a verdict on: a re-test looks at what changed since (rework.ts)
   passedSha: string | null; // the head commit QA signed off on: auto-merge merges exactly that
   fixReason: 'qa' | 'checks' | 'conflict' | null; // why it was last sent back to a developer
   mergeFixes: number; // times it went back for failing checks or conflicts
@@ -471,6 +473,7 @@ export class Swarm {
           ...q,
           authorId: q.authorId ?? q.devAgentId ?? null,
           testedSha: q.testedSha ?? null,
+          checkedSha: q.checkedSha ?? null,
           passedSha: q.passedSha ?? null,
           fixReason: q.fixReason ?? null,
           mergeFixes: q.mergeFixes ?? 0,
@@ -1047,7 +1050,13 @@ export class Swarm {
     }
     Object.assign(rec, step.set);
     if (step.do === 'requeue') {
-      // Commits arrived after QA's sign-off: they get tested too.
+      // Commits arrived after QA's sign-off. Clean merges of the default branch bring no code of the PR's own, so the
+      // checks on the new head decide, as after the office's own branch update. Anything else gets tested too.
+      const clean = rec.passedSha ? await this.backend.cleanMergesSince(repo.fullName, pr.number, rec.passedSha, repo.defaultBranch) : null;
+      if (clean && clean === pr.headSha) {
+        this.setQa(rec, { passedSha: clean, pendingSince: null, mergeNote: `only clean merges of ${repo.defaultBranch} since QA: no re-test` });
+        return false;
+      }
       this.setQa(rec, { status: 'queued', round: rec.round + 1, retests: rec.retests + 1, mergeNote: null, pendingSince: null });
       setTimeout(() => this.schedule(), 200);
       return false;
@@ -1949,6 +1958,7 @@ export class Swarm {
         sessionFailures: 0,
         mergeNote: null,
         testedSha: null,
+        checkedSha: null,
         passedSha: null,
         fixReason: null,
         mergeFixes: 0,
@@ -2053,13 +2063,16 @@ export class Swarm {
       `Please QA pull request #${pr.number}: ${pr.title}`,
       `URL: ${pr.url}`,
       `Author: ${dev ? `${dev.name} (developer agent)` : 'a teammate'} · QA round ${rec.round}`,
-      rec.fixReason === 'conflict'
-        ? `\nQA passed it before, but since then the branch was updated with ${repo.defaultBranch} to resolve merge conflicts. Re-check everything, especially where this change meets the newly merged work.`
-        : rec.fixReason === 'checks'
-          ? '\nQA passed it before, but since then the developer changed the code to fix failing GitHub checks. Re-check everything.'
-          : rec.round > 1 && rec.summary
-            ? `\nThis is a re-test after fixes. Last round's findings:\n${rec.summary}\n${rec.fixInstructions ?? ''}\nCheck those first, then re-check everything else.`
-            : '',
+      retestBrief({
+        round: rec.round,
+        fixReason: rec.fixReason,
+        summary: rec.summary,
+        fixInstructions: rec.fixInstructions,
+        sinceSha: rec.passedSha ?? rec.checkedSha,
+        passed: rec.passedSha != null,
+        headSha: pr.headSha,
+        base: repo.defaultBranch,
+      }).replace(/^(?=.)/, '\n'),
       '',
       'PR description:',
       pr.body.trim() || '(empty)',
@@ -2117,6 +2130,7 @@ export class Swarm {
         sessionFailures: 0,
         fixReason: pass ? null : 'qa',
         passedSha: pass ? rec.testedSha : null,
+        checkedSha: rec.testedSha,
         mergeNote: null,
         pendingSince: null,
         mergeRetryAt: null,

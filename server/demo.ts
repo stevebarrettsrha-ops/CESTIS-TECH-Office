@@ -500,6 +500,7 @@ export function createDemoBackend(): Backend {
       return dir;
     },
     removeDesk: async () => undefined,
+    cleanMergesSince: async () => null, // fake PRs have no history: new commits are always re-tested
     releaseDesk: async () => undefined,
     startSession: (opts, cb) => {
       if (++sessionsStarted === USAGE_WARNING_AT) fakeUsageWarning(cb);

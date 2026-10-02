@@ -40,6 +40,8 @@ export interface Backend {
   mainDir(fullName: string): string;
   deskDir(fullName: string, agentSlug: string): string;
   prepareDesk(fullName: string, base: workspace.DeskBase, agentSlug: string, branch: string): Promise<string>;
+  /** The PR's head if every commit since `fromSha` is a clean merge of the default branch, else null. */
+  cleanMergesSince(fullName: string, pr: number, fromSha: string, defaultBranch: string): Promise<string | null>;
   removeDesk(fullName: string, agentSlug: string): Promise<void>;
   /** Stop processes an agent left running (dev servers on its port, anything started in its desk). */
   releaseDesk(fullName: string, agentSlug: string, port: number): Promise<void>;
@@ -89,6 +91,7 @@ export const realBackend: Backend = {
   mainDir: workspace.mainDir,
   deskDir: workspace.deskDir,
   prepareDesk: workspace.prepareDesk,
+  cleanMergesSince: workspace.cleanMergesSince,
   removeDesk: workspace.removeDesk,
   releaseDesk: (fullName, agentSlug, port) => workspace.releaseDesk(fullName, agentSlug, port, officeProcesses()),
   startSession: (opts, cb) => (opts.terminal ? startCliSession(opts, cb) : startSession(opts, cb)),
