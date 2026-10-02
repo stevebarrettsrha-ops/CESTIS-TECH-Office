@@ -114,6 +114,7 @@ app.delete('/api/repos/:repo/preview', route((req) => swarm.stopPreview(repoId(r
 app.post('/api/repos/:repo/pulls/:n/merge', route((req) => swarm.mergePull(repoId(req), num(req.params.n), req.body?.method ?? 'squash')));
 app.post('/api/repos/:repo/pulls/:n/close', route((req) => swarm.closePull(repoId(req), num(req.params.n))));
 app.post('/api/repos/:repo/pulls/:n/qa', route((req) => swarm.sendToQa(repoId(req), num(req.params.n))));
+app.post('/api/repos/:repo/pulls/:n/approve', route((req) => swarm.approveQa(repoId(req), num(req.params.n))));
 app.post(
   '/api/repos/:repo/agents',
   route((req) =>

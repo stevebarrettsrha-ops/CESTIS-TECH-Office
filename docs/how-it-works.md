@@ -18,15 +18,16 @@ The details behind the office: how an issue becomes a merged pull request, who d
    - exercises the feature in a real headless browser (Playwright), including phone sizes and edge cases, taking screenshots of each important state
    - returns a structured report: a verdict, the checks performed, the commands run, and a caption for each screenshot
 4. **Evidence on the PR.** The server uploads the screenshots to an orphan branch called `swarm-qa-evidence`, so evidence never lands in your code, and posts a comment on the PR. The comment contains the verdict, a table of checks, the commands run, and the screenshots.
-5. **Fail → fix → re-test.** If QA fails, the report goes back to the developer who wrote the PR, who resumes their own session and pushes fixes to the same branch. If they're busy on something else, any free developer takes the fix instead. The PR then goes back to QA for the next round. After 3 failed rounds it's flagged **needs you**.
+5. **Fail → fix → re-test.** If QA fails, the report goes back to the developer who wrote the PR, who resumes their own session and pushes fixes to the same branch. If they're busy on something else, any free developer takes the fix instead. The PR then goes back to QA for the next round. A re-test checks last round's findings, then focuses on what changed since QA last looked, with a full run of the tests and build, rather than starting from scratch. After 3 failed rounds it's flagged **needs you**.
 6. **Merge.** Once QA passes, the PR moves to **Ready to merge**. With **auto-merge** on for the floor (the default; switch it in the manager's console or on the Kanban board), the office takes it from there:
-   - It waits for GitHub's checks (Actions, Vercel and so on) and merges as soon as they're green, but only the exact commit QA signed off on. Commits pushed after the sign-off go back through QA first.
-   - If checks fail, or the PR conflicts with the default branch because other work merged first, a free developer gets the failing checks or the conflict, fixes the branch, and QA re-tests it when the code changed. After 3 such fixes it's flagged **needs you**.
+   - **Nothing merges until you've checked QA's work.** Your phone tells you when a PR passes QA. Press **Approve QA** on its card: you see QA's summary, every check it made and a link to the full report with screenshots, and approve that exact commit. If the PR changes after that and goes back through QA, it needs your approval again. Clean merges of the default branch keep it, because they add no code of the PR's own.
+   - It waits for GitHub's checks (Actions, Vercel and so on) and merges as soon as they're green and you've approved, but only the exact commit QA signed off on. Commits pushed after the sign-off go back through QA first.
+   - If checks fail, or the PR conflicts with the default branch because other work merged first, a free developer gets the failing checks or the conflict, fixes the branch, and QA re-tests it when the code changed. New commits that are only clean merges of the default branch (git's own merge, nothing changed by hand) skip QA: GitHub's checks on the new head decide, as when the office updates the branch itself. After 3 such fixes it's flagged **needs you**.
    - It squash-merges (falling back to a merge commit if the repo doesn't allow squash), deletes the remote branch, and updates the branch first if the repo only merges up-to-date branches.
    - If GitHub refuses the merge (say, branch protection wants an approving review), your phone gets a message and the office retries every 10 minutes. Checks still running after 30 minutes also get a message.
    - Only `swarm/` branches merge themselves. PRs people opened are left for you.
 
-   With auto-merge off, review the PR on GitHub, including the QA comment, then press **Merge** (squash) on the board. Merging a PR that hasn't passed QA asks you to confirm first. Either way, the developer sees the merge, celebrates, and goes back to the backlog.
+   With auto-merge off, or to merge one yourself straight away, review the PR on GitHub, including the QA comment, then press **Merge** (squash) on the board. Merging a PR that hasn't passed QA asks you to confirm first. Either way, the developer sees the merge, celebrates, and goes back to the backlog.
 7. **Your folder catches up.** After any merge, the floor's folder fast-forwards to the default branch, but only when it's on that branch with no local changes. Nothing is ever stashed, reset or discarded; otherwise the manager's console shows why it wasn't updated (`2 behind: local changes`, `on branch feature-x`, `diverged`). If `package.json` or the lockfile changed, it runs `npm install`. **Sync now** in the manager's console retries.
 
    The office's own folder is the exception: pulling it would restart the office mid-work, so it shows `update ready` and the **Office** row at the top of the manager's console takes over. When the office was started by its launcher (`npm run dev` / `npm start`) and **Update automatically** is on, or you press **Update now**, the office drains: it starts no new issues, QA or CEO jobs, and lets the running sessions finish. Once nothing runs (or after 20 minutes, when the remaining sessions are stopped and their work goes back to the queue), it hands the update to the launcher, which pulls, installs, builds and restarts it; your phone then says which commit it moved to, or why the update was rolled back. **Later** postpones it for 2 hours, or until a newer commit lands. Started any other way, the office only reports the update.
@@ -34,6 +35,22 @@ The details behind the office: how an issue becomes a merged pull request, who d
 PRs opened by people, not agents, show up under **In QA** as "not tested yet", with a **Send to QA** button.
 
 You can message an agent at any time. While they're working, the message is injected into their live session. After a developer finishes, the message resumes their session, e.g. "the CI failed, please fix the lint errors".
+
+An agent you stop (or interrupt with Esc in their terminal, or one the office stopped for a restart or an update) keeps its task for 30 minutes, so you can carry on in their terminal or message them. After that it goes back to the pool for new work and lets go of its issue, and your phone says so.
+
+A session that shows no sign of work (nothing new in its log and nothing printed in its terminal) is probably stuck: waiting on a question nobody answers, a setup screen, or a dev server it left running in the foreground. After 20 quiet minutes your phone says so; after 30 the office stops the session and treats it as failed. The agent sits out the usual 2-minute cooldown, and the work goes back to the queue (an issue that fails twice is no longer picked up automatically).
+
+## Productivity
+
+The phone's **Company** tab shows the week at a glance:
+
+- **Merged**: how many pull requests merged this week and today, and the daily rate.
+- **Issue → merged**: the median time from an agent picking an issue up to its pull request merging.
+- **QA pass rate**: the share of QA rounds that passed, and how many rounds each merged pull request took.
+- **Cost per merged PR**: the session cost the agents reported (CEO included), divided by the merges.
+- **Staff time busy**: developer and QA session time over the staff's hours.
+
+The numbers come from the office's work log, `events.jsonl`, which keeps 30 days. Every merge also counts towards the Employee of the Month for each person who helped: the developer who opened it, whoever fixed it and the QA tester.
 
 ## QA testers
 
@@ -73,6 +90,7 @@ Agents can do anything your own coding agent in a terminal can. Run the office w
 ## Where things live
 
 - `~/.cestis-office/state.json`: floors, agents, settings and terminal history (`SWARM_HOME` overrides the folder)
+- `~/.cestis-office/events.jsonl`: the work log behind the productivity numbers (the last 30 days)
 - `~/.cestis-office/terminals/<agent>.ansi`: each agent's terminal screen and scrollback
 - `~/.cestis-office/sessions/<token>/`: a running CLI session's settings, MCP config and instructions (removed when it ends); `~/.cestis-office/bin/`: the small scripts the CLIs call back to the office with
 - `~/.cestis-office/workspaces/<owner>__<repo>/main`: a clone of each repo

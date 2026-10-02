@@ -36,6 +36,8 @@ export class AgentTerminal {
   rows = TERM_ROWS;
   /** Output arrived since the last save. */
   dirty = false;
+  /** When the CLI last printed anything (office notes don't count): the session watchdog's sign of life. */
+  lastOutputAt = 0;
   /** Closes a CLI left waiting at its prompt after its task (set by the runtime that left it there). */
   releaseIdle: (() => void) | null = null;
   /** Something the manager typed at that waiting prompt: the office takes it on as a follow-up (true) or refuses. */
@@ -62,14 +64,19 @@ export class AgentTerminal {
   /** Output from the CLI (or a note from the office): into the mirror and out to everyone watching. */
   write(data: string) {
     if (!data) return;
-    this.term.write(data);
-    this.dirty = true;
-    this.send({ t: 'data', data });
+    this.lastOutputAt = Date.now();
+    this.print(data);
   }
 
   /** A dim line from the office itself, e.g. between sessions. */
   note(text: string) {
-    this.write(`\r\n\x1b[2m${text}\x1b[0m\r\n`);
+    this.print(`\r\n\x1b[2m${text}\x1b[0m\r\n`);
+  }
+
+  private print(data: string) {
+    this.term.write(data);
+    this.dirty = true;
+    this.send({ t: 'data', data });
   }
 
   get live() {

@@ -3,16 +3,20 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import type { WebSocket } from 'ws';
 import type { Backend } from './backend.ts';
-import type { LogEntry, SessionHandle, SessionResult } from './agentRunner.ts';
+import type { LogEntry, SessionCallbacks, SessionHandle, SessionResult } from './agentRunner.ts';
 import type { PrDetails } from './github.ts';
-import { defaultProjectsDir, HOME_DIR, LOG_BUFFER, SCHEDULER_INTERVAL_MS, STATE_FILE, SYNC_INTERVAL_MS, WORKSPACE_ROOT } from './config.ts';
+import { defaultProjectsDir, EVENTS_FILE, HOME_DIR, LOG_BUFFER, SCHEDULER_INTERVAL_MS, STATE_FILE, SYNC_INTERVAL_MS, WORKSPACE_ROOT } from './config.ts';
 import { ceoJobPrompt, ceoSystemPrompt, createOfficeTools, IssueCap, jobLabel, planRoute, specialtyLabel, specialtySlug, type CeoJob, type OfficeTools } from './ceo.ts';
 import { HttpError } from './httpError.ts';
-import { CHECKS_ALERT_MS, MAX_MERGE_FIXES, MERGE_RETRY_MS, mergeStep } from './mergeGate.ts';
+import { carryApproval, CHECKS_ALERT_MS, MAX_MERGE_FIXES, MERGE_RETRY_MS, mergeStep } from './mergeGate.ts';
 import { DEFAULT_PREVIEW, Previews, parsePreviewPatch } from './previews.ts';
 import { drainDecision, lastUpdateMessage, POSTPONE_MS, type DrainInput, type LastUpdate } from './officeUpdate.ts';
 import { clampPacingSessions, DEFAULT_PACING_SESSIONS, mayStart, PACING_MS, pacingMessage, usageLabel, usageView, type UsageWarning, type WorkKind } from './pacing.ts';
 import { isCli } from './clis.ts';
+import { metricsView, WorkLog, type WorkEvent } from './metrics.ts';
+import { STOPPED_RELEASE_MS, stoppedDue } from './stopped.ts';
+import { STALL_STOP_MS, STALL_WARN_MS, stallAction } from './watchdog.ts';
+import { retestBrief } from './rework.ts';
 import { AgentTerminal } from './terminal.ts';
 import { blockers, holdUps, issueSpecialty } from '../shared/issues.ts';
 import { effectiveModel } from '../shared/models.ts';
@@ -31,6 +35,7 @@ import type {
   HireRequestView,
   IssueInfo,
   LogLine,
+  MetricsView,
   OfficeUpdateView,
   PhoneMessage,
   PreviewConfig,
@@ -104,13 +109,16 @@ interface PersistedAgent {
 }
 
 /** A pull request's trip through QA. */
-interface QaRecord extends QaView {
+interface QaRecord extends Omit<QaView, 'approved'> {
   issueNumber: number | null;
+  authorId: string | null; // the developer who opened it (devAgentId moves to whoever fixes it)
   devSessionId: string | null; // the dev's Claude Code session, resumed to fix QA findings
   fixInstructions: string | null;
   sessionFailures: number;
   testedSha: string | null; // the head commit QA is testing
+  checkedSha: string | null; // the head QA last gave a verdict on: a re-test looks at what changed since (rework.ts)
   passedSha: string | null; // the head commit QA signed off on: auto-merge merges exactly that
+  approvedSha: string | null; // the commit whose QA report the manager approved: auto-merge waits for it to match
   fixReason: 'qa' | 'checks' | 'conflict' | null; // why it was last sent back to a developer
   mergeFixes: number; // times it went back for failing checks or conflicts
   retests: number; // QA rounds caused by merge fixes or new commits rather than by QA failing it
@@ -159,6 +167,7 @@ interface AgentRuntime {
   screenshot: { data: Buffer; mime: string; at: number } | null;
   shots: Shot[]; // every screenshot of the current session (QA evidence)
   terminal: AgentTerminal | null; // their terminal, once they've run in the terminal runtime
+  watch?: { seenAt: number; warned: boolean; stalled: boolean }; // the running session, for the watchdog (watchdog.ts)
 }
 
 interface RepoRuntime {
@@ -415,6 +424,9 @@ export class Swarm {
   };
   private lastOfficeView = '';
   private clis: CliView[] = []; // coding-agent CLIs found on this machine (detected at startup)
+  private work = new WorkLog(EVENTS_FILE); // the history the productivity numbers come from
+  private metricsTimer: NodeJS.Timeout | null = null;
+  private stoppedSince = new Map<string, number>(); // agent id → when it was first seen stopped (see stopped.ts)
 
   constructor(private backend: Backend) {
     this.previews = new Previews(backend, {
@@ -429,6 +441,7 @@ export class Swarm {
   // ---------- lifecycle ----------
 
   async init() {
+    await this.work.load().catch((err) => console.warn('could not read the work log', err));
     try {
       const raw = await fs.readFile(STATE_FILE, 'utf8');
       const loaded = JSON.parse(raw) as Partial<Persisted>;
@@ -459,8 +472,11 @@ export class Swarm {
         })),
         qa: (loaded.qa ?? []).map((q) => ({
           ...q,
+          authorId: q.authorId ?? q.devAgentId ?? null,
           testedSha: q.testedSha ?? null,
+          checkedSha: q.checkedSha ?? null,
           passedSha: q.passedSha ?? null,
+          approvedSha: q.approvedSha ?? null,
           fixReason: q.fixReason ?? null,
           mergeFixes: q.mergeFixes ?? 0,
           retests: q.retests ?? 0,
@@ -589,7 +605,7 @@ export class Swarm {
         this.clearTask(a);
         continue;
       }
-      if (this.slotsFull()) continue; // stays 'stopped'; the manager can resume it later
+      if (this.slotsFull()) continue; // stays 'stopped': the manager can resume it, or it goes back to the pool (stopped.ts)
       void this.message(a.id, 'The office server restarted while you were working. Check the state of your worktree and continue where you left off.').catch((err) =>
         console.warn(`could not resume ${a.name}`, err),
       );
@@ -682,6 +698,7 @@ export class Swarm {
       checks: q.checks,
       commentUrl: q.commentUrl,
       mergeNote: q.mergeNote,
+      approved: q.status === 'passed' && q.passedSha != null && q.approvedSha === q.passedSha,
       updatedAt: q.updatedAt,
     };
   }
@@ -702,6 +719,7 @@ export class Swarm {
       messages: this.state.messages.slice(-100),
       phoneReadAt: this.state.phoneReadAt,
       usage: this.usageNow(),
+      metrics: this.metricsNow(),
       clis: this.clis,
       officeCommit: this.officeHead?.slice(0, 7) ?? null,
       officeUpdate: this.officeHead ? this.officeUpdateView() : undefined,
@@ -735,6 +753,22 @@ export class Swarm {
 
   private emitRepo(r: PersistedRepo) {
     this.broadcast({ type: 'repo', repo: this.repoView(r) });
+  }
+
+  // ---------- work log ----------
+
+  /** Log what happened to a piece of work, and refresh the productivity numbers shortly after. */
+  private record(e: WorkEvent) {
+    this.work.add(e);
+    if (this.metricsTimer) return;
+    this.metricsTimer = setTimeout(() => {
+      this.metricsTimer = null;
+      this.broadcast({ type: 'metrics', metrics: this.metricsNow() });
+    }, 2000);
+  }
+
+  private metricsNow(): MetricsView {
+    return metricsView(this.work.events, Date.now(), this.state.agents.filter((a) => a.role !== 'ceo').length);
   }
 
   private emitAgent(a: PersistedAgent) {
@@ -1019,7 +1053,13 @@ export class Swarm {
     }
     Object.assign(rec, step.set);
     if (step.do === 'requeue') {
-      // Commits arrived after QA's sign-off: they get tested too.
+      // Commits arrived after QA's sign-off. Clean merges of the default branch bring no code of the PR's own, so the
+      // checks on the new head decide, as after the office's own branch update. Anything else gets tested too.
+      const clean = rec.passedSha ? await this.backend.cleanMergesSince(repo.fullName, pr.number, rec.passedSha, repo.defaultBranch) : null;
+      if (clean && clean === pr.headSha) {
+        this.setQa(rec, { passedSha: clean, approvedSha: carryApproval(rec, clean), pendingSince: null, mergeNote: `only clean merges of ${repo.defaultBranch} since QA: no re-test` });
+        return false;
+      }
       this.setQa(rec, { status: 'queued', round: rec.round + 1, retests: rec.retests + 1, mergeNote: null, pendingSince: null });
       setTimeout(() => this.schedule(), 200);
       return false;
@@ -1036,7 +1076,7 @@ export class Swarm {
       this.mergeNote(rec, `updating the branch with ${repo.defaultBranch}`);
       await this.backend.updateBranch(repo.fullName, pr.number);
       const details = await this.backend.prDetails(repo.fullName, pr.number);
-      this.setQa(rec, { passedSha: details.headSha });
+      this.setQa(rec, { passedSha: details.headSha, approvedSha: carryApproval(rec, details.headSha) });
       return false;
     }
     if (step.do !== 'merge') return false;
@@ -1129,6 +1169,7 @@ export class Swarm {
    */
   async shutdown(restart = false): Promise<void> {
     await this.writeState().catch((err) => console.warn('could not save the state', err));
+    await this.work.flush();
     await this.backend.releaseClis(restart); // before the terminals are saved: whatever they print next waits in the keeper
     await this.saveTerminals(true);
     await this.previews.stopAll(this.state.repos);
@@ -1184,6 +1225,33 @@ export class Swarm {
 
   /** Keep agents and QA records in step with what happened to PRs on GitHub. */
   private reconcilePulls(repo: PersistedRepo, pulls: PullInfo[]) {
+    // A merge seen for the first time: log it and credit everyone who helped, once each. Credit comes from the QA
+    // record as well as the developer's desk, since a developer has usually moved on to another issue by now.
+    for (const pr of pulls) {
+      if (pr.state !== 'MERGED' || this.work.hasMerged(repo.id, pr.number)) continue;
+      const rec = this.state.qa.find((q) => q.repoId === repo.id && q.prNumber === pr.number);
+      const holders = this.state.agents.filter((a) => a.repoId === repo.id && a.role === 'dev' && a.task !== 'qa' && a.prNumber === pr.number);
+      if (!rec && holders.length === 0) continue; // not the office's work
+      const ids = new Set([...holders.map((a) => a.id), rec?.authorId, rec?.devAgentId, rec?.qaAgentId].filter((id): id is string => !!id));
+      const credited = this.state.agents.filter((a) => ids.has(a.id));
+      for (const a of credited) {
+        a.merged = (a.merged ?? 0) + 1;
+        this.emitAgent(a);
+      }
+      const time = (iso: string | null) => (iso && Number.isFinite(Date.parse(iso)) ? Date.parse(iso) : null);
+      this.record({
+        at: time(pr.mergedAt) ?? Date.now(),
+        kind: 'merged',
+        repoId: repo.id,
+        pr: pr.number,
+        issue: rec?.issueNumber ?? holders[0]?.issueNumber ?? pr.closesIssues[0] ?? null,
+        credited: credited.map((a) => a.id),
+        qaRounds: rec?.round ?? 0,
+        mergeFixes: rec?.mergeFixes ?? 0,
+        openedAt: time(pr.createdAt),
+      });
+    }
+
     for (const a of this.state.agents) {
       if (a.repoId !== repo.id || a.role !== 'dev' || a.prNumber == null || BUSY.includes(a.status) || a.status === 'idle') continue;
       const pr = pulls.find((p) => p.number === a.prNumber);
@@ -1193,7 +1261,6 @@ export class Swarm {
         continue;
       }
       this.appendLog(a, [{ kind: 'done', text: pr.state === 'MERGED' ? `🎉 PR #${pr.number} was merged. Ready for the next issue.` : `PR #${pr.number} was closed without merging.` }]);
-      if (pr.state === 'MERGED') a.merged = (a.merged ?? 0) + 1;
       this.clearTask(a);
     }
 
@@ -1201,11 +1268,6 @@ export class Swarm {
     for (const q of this.state.qa.filter((x) => x.repoId === repo.id)) {
       const pr = pulls.find((p) => p.number === q.prNumber);
       if (pr && pr.state !== 'OPEN' && q.status !== 'testing' && q.status !== 'fixing') {
-        const tester = pr.state === 'MERGED' && q.qaAgentId ? this.state.agents.find((x) => x.id === q.qaAgentId) : undefined;
-        if (tester) {
-          tester.merged = (tester.merged ?? 0) + 1;
-          this.emitAgent(tester);
-        }
         this.state.qa = this.state.qa.filter((x) => x !== q);
         this.broadcast({ type: 'qaRemoved', repoId: repo.id, prNumber: q.prNumber });
       }
@@ -1428,14 +1490,83 @@ export class Swarm {
   resetAgent(id: string) {
     const a = this.agent(id);
     if (BUSY.includes(a.status)) throw new HttpError(409, `${a.name} is busy; stop them first`);
+    this.clearDesk(a, '↺ Cleared desk. Ready for new work.');
+  }
+
+  /** Drop an agent's task (and hand back any QA work it held) so it can take new work. */
+  private clearDesk(a: PersistedAgent, note: string) {
     for (const q of this.state.qa) {
-      if (q.qaAgentId === id && q.status === 'testing') this.setQa(q, { status: 'queued', qaAgentId: null });
-      if (q.devAgentId === id && q.status === 'fixing') this.setQa(q, { status: 'failed' });
+      if (q.qaAgentId === a.id && q.status === 'testing') this.setQa(q, { status: 'queued', qaAgentId: null });
+      if (q.devAgentId === a.id && q.status === 'fixing') this.setQa(q, { status: 'failed' });
     }
-    this.agentRt.get(id)?.terminal?.releaseIdle?.();
+    this.agentRt.get(a.id)?.terminal?.releaseIdle?.();
     this.clearTask(a);
-    this.appendLog(a, [{ kind: 'system', text: '↺ Cleared desk. Ready for new work.' }]);
+    this.appendLog(a, [{ kind: 'system', text: note }]);
     this.save();
+  }
+
+  /** A session's callbacks, with every report it makes counted as a sign of work for the watchdog. */
+  private watched(rt: AgentRuntime, cb: SessionCallbacks): SessionCallbacks {
+    const watch = { seenAt: Date.now(), warned: false, stalled: false };
+    rt.watch = watch;
+    const seen = () => {
+      watch.seenAt = Date.now();
+    };
+    return {
+      ...cb,
+      log: (entries) => (seen(), cb.log(entries)),
+      tool: (name) => (seen(), cb.tool(name)),
+      sessionId: (id) => (seen(), cb.sessionId(id)),
+      browserUrl: (url) => (seen(), cb.browserUrl(url)),
+      screenshot: (data, mime) => (seen(), cb.screenshot(data, mime)),
+      turn: cb.turn && ((text) => (seen(), cb.turn!(text))),
+    };
+  }
+
+  /** Warn about sessions that have gone quiet, and stop the ones that stayed quiet (watchdog.ts). */
+  private watchSessions() {
+    const now = Date.now();
+    for (const a of this.state.agents) {
+      const rt = this.agentRt.get(a.id);
+      const watch = rt?.watch;
+      if (!rt?.session || !watch || watch.stalled || !BUSY.includes(a.status)) continue;
+      const lastSeen = Math.max(watch.seenAt, rt.terminal?.lastOutputAt ?? 0);
+      const action = stallAction(now, lastSeen, watch.warned);
+      if (!action) {
+        if (now - lastSeen < STALL_WARN_MS) watch.warned = false; // back at work: a later quiet spell is warned about again
+        continue;
+      }
+      const on = a.role === 'ceo' ? '' : a.task === 'qa' ? ` testing PR #${a.prNumber}` : a.task === 'fix' ? ` fixing PR #${a.prNumber}` : a.issueNumber ? ` on #${a.issueNumber}` : '';
+      if (action === 'warn') {
+        watch.warned = true;
+        const mins = Math.round(STALL_WARN_MS / 60_000);
+        this.appendLog(a, [{ kind: 'error', text: `⏱ No sign of work for ${mins} minutes. The office stops this session at ${Math.round(STALL_STOP_MS / 60_000)} minutes unless it carries on.` }]);
+        this.postMessage('office', `⏱ ${a.name} has shown no sign of work for ${mins} minutes${on}. Their terminal may be waiting for an answer; the office stops the session in ${Math.round((STALL_STOP_MS - STALL_WARN_MS) / 60_000)} minutes if nothing changes.`);
+        continue;
+      }
+      watch.stalled = true;
+      const mins = Math.round(STALL_STOP_MS / 60_000);
+      this.appendLog(a, [{ kind: 'error', text: `⏱ No sign of work for ${mins} minutes: stopping the session.` }]);
+      const next = a.role === 'ceo' ? '' : ' The work goes back to the queue.';
+      this.postMessage('office', `⏱ ${a.name} showed no sign of work for ${mins} minutes${on}, so the office stopped the session.${next}`);
+      rt.session.stop();
+    }
+  }
+
+  /** Agents stopped for a while go back to the pool and let go of their issue (stopped.ts). */
+  private releaseStopped() {
+    const staff = this.state.agents.filter((a) => a.role !== 'ceo');
+    const candidates = staff.map((a) => ({ id: a.id, stopped: a.status === 'stopped', session: !!this.agentRt.get(a.id)?.session }));
+    const due = stoppedDue(candidates, this.stoppedSince, Date.now());
+    if (due.length === 0) return;
+    const minutes = Math.round(STOPPED_RELEASE_MS / 60_000);
+    const names: string[] = [];
+    for (const a of staff.filter((x) => due.includes(x.id))) {
+      const held = a.issueNumber ? ` Let go of #${a.issueNumber}.` : '';
+      this.clearDesk(a, `↺ Stopped for ${minutes} minutes, so back in the pool for new work.${held}`);
+      names.push(a.name);
+    }
+    this.postMessage('office', `↺ ${names.join(', ')} had been stopped for ${minutes} minutes and ${names.length === 1 ? 'is' : 'are'} back in the pool for new work.`);
   }
 
   private issueTaken(repo: PersistedRepo, n: number) {
@@ -1584,6 +1715,7 @@ export class Swarm {
     rt.browserUrl = null;
     rt.shots = [];
     void removeScreens(a.id);
+    if (a.task) this.record({ at: a.startedAt!, kind: 'start', repoId: a.repoId, agentId: a.id, task: a.task, issue: a.issueNumber, pr: a.prNumber });
     this.appendLog(a, [
       { kind: 'system', text: '' },
       { kind: 'system', text: `━━━ ${banner} ━━━` },
@@ -1669,7 +1801,7 @@ export class Swarm {
         agentId: a.id,
         ...how,
       },
-      {
+      this.watched(rt, {
         log: (entries) => this.appendLog(a, entries),
         tool: (name) => {
           if (rt.currentTool === name) return;
@@ -1698,7 +1830,7 @@ export class Swarm {
         limited: (at) => this.pauseForLimit(at),
         usageWarning: (info) => this.paceForWarning(info),
         finished: (result) => void this.onFinished(a, repo, result),
-      },
+      }),
     );
   }
 
@@ -1706,11 +1838,13 @@ export class Swarm {
     const rt = this.agentRt.get(a.id);
     if (!rt || !this.state.agents.includes(a)) return; // fired
     if (this.officeUpdate.handedOver) return; // stopped for the office's update: recovered like after a restart
+    result = this.stallResult(rt, result);
     rt.session = null;
     rt.currentTool = null;
     a.endedAt = Date.now();
     a.costUsd += result.costUsd;
     a.turns += result.turns;
+    this.recordSession(a, result);
     // Dev servers the agent forgot to stop would otherwise keep its port and lock its desk folder.
     void this.backend.releaseDesk(repo.fullName, this.agentSlug(a), this.port(a)).catch(() => undefined);
     if (result.interrupted) this.interrupted(a);
@@ -1723,6 +1857,19 @@ export class Swarm {
     this.save();
     void this.syncRepo(repo.id);
     setTimeout(() => this.schedule(), 500);
+  }
+
+  /** A session the watchdog stopped ends as a failure, so its work is retried (and counted against the issue). */
+  private stallResult(rt: AgentRuntime, result: SessionResult): SessionResult {
+    const stalled = rt.watch?.stalled;
+    rt.watch = undefined;
+    if (!stalled) return result;
+    return { ...result, ok: false, interrupted: false, errors: [`No sign of work for ${Math.round(STALL_STOP_MS / 60_000)} minutes, so the office stopped the session`] };
+  }
+
+  private recordSession(a: PersistedAgent, result: SessionResult) {
+    const ms = a.startedAt && a.endedAt ? Math.max(0, a.endedAt - a.startedAt) : 0;
+    this.record({ at: a.endedAt ?? Date.now(), kind: 'session', repoId: a.repoId, agentId: a.id, task: a.task, ms, costUsd: result.costUsd, ok: result.ok });
   }
 
   private minutes(a: PersistedAgent) {
@@ -1808,12 +1955,15 @@ export class Swarm {
         commentUrl: null,
         updatedAt: Date.now(),
         issueNumber,
+        authorId: dev?.id ?? null,
         devSessionId: dev && dev.prNumber === prNumber ? dev.sessionId : null,
         fixInstructions: null,
         sessionFailures: 0,
         mergeNote: null,
         testedSha: null,
+        checkedSha: null,
         passedSha: null,
+        approvedSha: null,
         fixReason: null,
         mergeFixes: 0,
         retests: 0,
@@ -1825,6 +1975,16 @@ export class Swarm {
       this.setQa(rec, {});
     }
     setTimeout(() => this.schedule(), 200);
+  }
+
+  /** The manager checked QA's report on a passed PR and approves it: auto-merge may merge that exact commit. */
+  approveQa(repoId: string, prNumber: number) {
+    const repo = this.repo(repoId);
+    const rec = this.state.qa.find((q) => q.repoId === repo.id && q.prNumber === prNumber);
+    if (!rec || rec.status !== 'passed' || !rec.passedSha) throw new HttpError(409, `PR #${prNumber} hasn't passed QA, so there is no QA report to approve yet`);
+    this.setQa(rec, { approvedSha: rec.passedSha, mergeNote: repo.autoMerge ? "approved: merges once GitHub's checks are green" : 'approved' });
+    this.toast('success', `👍 Approved PR #${prNumber}${repo.autoMerge ? "; it merges once GitHub's checks are green" : ''}`);
+    void this.syncRepo(repo.id);
   }
 
   /** Manager's "send to QA" for any open PR (including ones opened by people). */
@@ -1917,13 +2077,16 @@ export class Swarm {
       `Please QA pull request #${pr.number}: ${pr.title}`,
       `URL: ${pr.url}`,
       `Author: ${dev ? `${dev.name} (developer agent)` : 'a teammate'} · QA round ${rec.round}`,
-      rec.fixReason === 'conflict'
-        ? `\nQA passed it before, but since then the branch was updated with ${repo.defaultBranch} to resolve merge conflicts. Re-check everything, especially where this change meets the newly merged work.`
-        : rec.fixReason === 'checks'
-          ? '\nQA passed it before, but since then the developer changed the code to fix failing GitHub checks. Re-check everything.'
-          : rec.round > 1 && rec.summary
-            ? `\nThis is a re-test after fixes. Last round's findings:\n${rec.summary}\n${rec.fixInstructions ?? ''}\nCheck those first, then re-check everything else.`
-            : '',
+      retestBrief({
+        round: rec.round,
+        fixReason: rec.fixReason,
+        summary: rec.summary,
+        fixInstructions: rec.fixInstructions,
+        sinceSha: rec.passedSha ?? rec.checkedSha,
+        passed: rec.passedSha != null,
+        headSha: pr.headSha,
+        base: repo.defaultBranch,
+      }).replace(/^(?=.)/, '\n'),
       '',
       'PR description:',
       pr.body.trim() || '(empty)',
@@ -1969,6 +2132,7 @@ export class Swarm {
       } catch (err) {
         this.appendLog(a, [{ kind: 'error', text: `  ⎿ Could not post the QA report: ${(err as Error).message}` }]);
       }
+      this.record({ at: Date.now(), kind: 'verdict', repoId: repo.id, agentId: a.id, pr: rec.prNumber, round: rec.round, pass });
       const qaRounds = rec.round - rec.retests; // rounds QA itself asked for
       const nextStatus = pass ? 'passed' : qaRounds >= MAX_QA_ROUNDS ? 'needs-human' : 'failed';
       this.setQa(rec, {
@@ -1980,6 +2144,7 @@ export class Swarm {
         sessionFailures: 0,
         fixReason: pass ? null : 'qa',
         passedSha: pass ? rec.testedSha : null,
+        checkedSha: rec.testedSha,
         mergeNote: null,
         pendingSince: null,
         mergeRetryAt: null,
@@ -1988,11 +2153,14 @@ export class Swarm {
       this.toast(
         pass ? 'success' : 'error',
         pass
-          ? `✅ ${a.name} passed PR #${rec.prNumber}${repo.autoMerge ? "; it merges once GitHub's checks are green" : ': ready to merge'}`
+          ? `✅ ${a.name} passed PR #${rec.prNumber}${repo.autoMerge ? ': check the QA report and approve it on the board to merge it' : ': ready to merge'}`
           : nextStatus === 'needs-human'
             ? `❌ PR #${rec.prNumber} failed QA ${qaRounds} times and needs a human`
             : `❌ ${a.name} failed PR #${rec.prNumber}; sending it back to the developer`,
       );
+      if (pass && repo.autoMerge) {
+        this.postMessage('office', `✅ PR #${rec.prNumber} on ${repo.fullName} passed QA. Check the QA report and approve it on floor ${repo.floor}'s board: it merges only after you do.`);
+      }
     }
   }
 
@@ -2031,7 +2199,7 @@ export class Swarm {
     if (!pass && report.fixInstructions) lines.push('', '### 🔧 What needs fixing', '', report.fixInstructions);
     if (images.length) lines.push('', '### 📸 Evidence', '', ...images.flatMap((img) => [img, '']));
     else lines.push('', '_No browser screenshots were taken in this round._');
-    const merge = repo.autoMerge ? "merges automatically once GitHub's checks pass" : 'ready for the manager to merge';
+    const merge = repo.autoMerge ? "merges once the manager approves this report and GitHub's checks pass" : 'ready for the manager to merge';
     lines.push('', `<sub>Posted by C.E.S.T.I.S Office · ${pass ? merge : rec.round - rec.retests >= MAX_QA_ROUNDS ? 'needs a human decision' : 'sent back to the developer for fixes'}</sub>`);
     return lines.join('\n');
   }
@@ -2362,6 +2530,8 @@ export class Swarm {
    */
   private schedule() {
     this.tickUsage();
+    this.watchSessions();
+    this.releaseStopped();
     if (this.officeUpdateTick()) return; // draining for the office's own update
     if (this.limited()) return;
     // Management first: the CEO's jobs are short and shape everyone else's work.
@@ -2687,7 +2857,7 @@ export class Swarm {
         office: this.officeTools(),
         ...how,
       },
-      {
+      this.watched(rt, {
         log: (entries) => this.appendLog(a, entries),
         tool: (name) => {
           if (rt.currentTool === name) return;
@@ -2704,18 +2874,20 @@ export class Swarm {
         limited: (at) => this.pauseForLimit(at),
         usageWarning: (info) => this.paceForWarning(info),
         finished: (result) => this.onCeoFinished(a, result),
-      },
+      }),
     );
   }
 
   private onCeoFinished(a: PersistedAgent, result: SessionResult) {
     const rt = this.agentRt.get(a.id);
     if (!rt || this.officeUpdate.handedOver) return;
+    result = this.stallResult(rt, result);
     rt.session = null;
     rt.currentTool = null;
     a.endedAt = Date.now();
     a.costUsd += result.costUsd;
     a.turns += result.turns;
+    this.recordSession(a, result);
     const job = this.state.ceo.job;
     this.state.ceo.job = null;
     if (result.interrupted) this.interrupted(a);

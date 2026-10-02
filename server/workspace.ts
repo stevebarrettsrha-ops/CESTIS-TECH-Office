@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { WORKSPACE_ROOT } from './config.ts';
 import { gh, git, run } from './exec.ts';
+import { parseParents } from './rework.ts';
 
 // Layout on disk:
 //   <your projects folder>/<repo>                    the floor's main checkout: your own folder, only fetched and fast-forwarded (syncMain)
@@ -314,6 +315,51 @@ export function removeDesk(fullName: string, agentSlug: string): Promise<void> {
     await removeDir(wt).catch(() => undefined);
     await git(['worktree', 'prune'], { cwd: main }).catch(() => undefined);
   });
+}
+
+// ---------- clean merges ----------
+
+const isAncestor = (dir: string, a: string, b: string) =>
+  git(['merge-base', '--is-ancestor', a, b], { cwd: dir }).then(
+    () => true,
+    () => false,
+  );
+
+/**
+ * Are the commits from `fromSha` to `head` only clean merges of `baseRef`? Each must be a merge commit that brings in
+ * part of `baseRef` with exactly the result git produces by itself (no conflicts, nothing changed by hand). If so, a
+ * PR QA passed at `fromSha` has no new code of its own; the checks on `head` cover how it meets the merged work.
+ */
+export async function onlyCleanMerges(dir: string, fromSha: string, head: string, baseRef: string): Promise<boolean> {
+  if (!(await isAncestor(dir, fromSha, head))) return false; // rewritten history, or a commit this clone hasn't got
+  const commits = (await git(['rev-list', '--first-parent', '--parents', `${fromSha}..${head}`], { cwd: dir })).split('\n').map(parseParents);
+  if (commits.length === 0 || commits.some((c) => !c)) return false;
+  for (const c of commits) {
+    const [ours, theirs, ...more] = c!.parents;
+    if (!theirs || more.length > 0) return false; // new code, or an octopus merge
+    if (!(await isAncestor(dir, theirs, baseRef))) return false; // what came in isn't the default branch
+    // merge-tree fails on conflicts: whatever was committed was resolved by hand.
+    const auto = await git(['merge-tree', '--write-tree', ours, theirs], { cwd: dir }).then(
+      (out) => out.split('\n')[0].trim(),
+      () => null,
+    );
+    if (!auto || auto !== (await git(['rev-parse', `${c!.sha}^{tree}`], { cwd: dir }))) return false;
+  }
+  return true;
+}
+
+/**
+ * The PR's head, if everything committed to it since `fromSha` is clean merges of the default branch; otherwise null.
+ * Any trouble (a git too old for merge-tree --write-tree, a failed fetch) also means null: QA re-tests it as usual.
+ */
+export function cleanMergesSince(fullName: string, pr: number, fromSha: string, defaultBranch: string): Promise<string | null> {
+  return withRepoLock(fullName, async () => {
+    const main = mainDir(fullName);
+    const ref = `refs/remotes/origin/pr/${pr}`;
+    await git(['fetch', 'origin', `+refs/heads/${defaultBranch}:refs/remotes/origin/${defaultBranch}`, `+refs/pull/${pr}/head:${ref}`], { cwd: main, timeoutMs: 180_000 });
+    const head = await git(['rev-parse', ref], { cwd: main });
+    return (await onlyCleanMerges(main, fromSha, head, `origin/${defaultBranch}`)) ? head : null;
+  }).catch(() => null);
 }
 
 // ---------- leftover processes ----------

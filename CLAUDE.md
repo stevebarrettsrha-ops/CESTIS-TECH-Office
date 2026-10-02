@@ -86,8 +86,17 @@ Server (`server/`, Node + Express 5 + ws, run by tsx in development; esbuild bun
 - `previews.ts`: one preview per floor: ports (6300 + floor), statuses, config validation.
 - `previewRunner.ts`: checks out, installs and runs a floor's app in its preview worktree; kills the process tree.
 - `httpError.ts`: `HttpError(status, message)`.
+- `mergeGate.ts`: auto-merge's next step for a QA-passed PR (pure). Nothing merges until the manager has approved QA's
+  report on that exact commit (`QaRecord.approvedSha`, **Approve QA** on the board, `POST /api/repos/:repo/pulls/:n/approve`).
 - `officeUpdate.ts`: the office's self-update: the drain decision, the launcher contract (IPC, `last-update.json`).
 - `pacing.ts`: pacing new work after Claude's usage warnings: the start/skip decision and the usage state.
+- `metrics.ts`: the work log (`<SWARM_HOME>/events.jsonl`: tasks started, sessions, QA verdicts, merges) and the
+  productivity numbers computed from it (`MetricsView`: throughput, cycle time, QA pass rate, cost, utilization).
+- `stopped.ts`: when an agent left `stopped` goes back to the pool (after `STOPPED_RELEASE_MS`) and lets go of its issue.
+- `rework.ts`: QA re-tests focus on what changed since the last verdict (`retestBrief`, `QaRecord.checkedSha`); new
+  commits that are only clean merges of the default branch skip QA (`onlyCleanMerges` / `cleanMergesSince` in `workspace.ts`).
+- `watchdog.ts`: a session with no sign of work (no reports, no terminal output) is warned about at `STALL_WARN_MS`
+  and stopped at `STALL_STOP_MS`; `swarm.ts` then handles it as a failed session, so the work is retried.
 
 The `cestis-office` command (`bin/cestis-office.js`, plain JS): checks Node/git/gh/Claude login, starts `dist-server/index.js`,
 opens the browser; `login` and `doctor` subcommands.

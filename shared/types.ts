@@ -222,6 +222,7 @@ export interface QaView {
   checks: QaCheck[];
   commentUrl: string | null; // the PR comment with the latest QA report
   mergeNote: string | null; // where auto-merge stands once QA passed, e.g. "waiting for checks: Vercel"
+  approved: boolean; // the manager approved QA's report on the commit QA passed: auto-merge may merge it
   updatedAt: number;
 }
 
@@ -247,6 +248,26 @@ export interface SwarmSettings {
 export interface UsageView {
   state: 'normal' | 'pacing' | 'paused';
   until: number | null;
+}
+
+/** The office's productivity over one window (the last day or week), from its work log. */
+export interface MetricsWindow {
+  merged: number; // PRs merged
+  medianCycleMin: number | null; // issue picked up (or PR opened, when the pick-up wasn't logged) → merged
+  qaRounds: number; // QA verdicts given
+  qaPassRate: number | null; // share of QA rounds that passed, 0..1
+  avgQaRounds: number | null; // QA rounds per merged PR
+  costUsd: number; // reported session cost, CEO included
+  costPerMerged: number | null;
+  busyHours: number; // developer and QA session time
+  utilization: number | null; // busyHours over the staff's available hours, 0..1
+}
+
+export interface MetricsView {
+  since: number | null; // the oldest logged event: windows shorter than the log are partial
+  day: MetricsWindow;
+  week: MetricsWindow;
+  perDay: number | null; // merged PRs per day over the week (or since the log began)
 }
 
 /**
@@ -324,6 +345,7 @@ export interface WorldSnapshot {
   officeCommit?: string | null; // short sha the server started on (absent on servers without self-update)
   officeUpdate?: OfficeUpdateView;
   usage: UsageView;
+  metrics: MetricsView;
   clis: CliView[];
 }
 
@@ -344,6 +366,7 @@ export type ServerEvent =
   | { type: 'phoneRead'; at: number }
   | { type: 'officeUpdate'; officeUpdate: OfficeUpdateView }
   | { type: 'usage'; usage: UsageView }
+  | { type: 'metrics'; metrics: MetricsView }
   | { type: 'clis'; clis: CliView[] }
   | { type: 'toast'; level: 'info' | 'success' | 'error'; text: string };
 

@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../api';
 import { isBusy, pendingRequests, qaKey, unreadMessages, useStore, type PhoneTab } from '../store';
-import { CEO_ID, type HireRequestView, type PhoneMessage } from '../../../shared/types';
+import { CEO_ID, type HireRequestView, type MetricsView, type PhoneMessage } from '../../../shared/types';
 import { Markdown } from './Markdown';
 import { MessageBox } from './MessageBox';
 import { closeOverlay } from './Overlays';
@@ -270,20 +270,30 @@ function useCompany() {
         prs: r.pulls.filter((p) => p.state === 'OPEN').length,
         inQa: recs.filter((q) => q && q.status !== 'passed' && q.status !== 'needs-human').length,
         ready: recs.filter((q) => q?.status === 'passed').length,
+        // Auto-merge floors wait for the manager to approve QA's report; the others wait for the manager to merge.
+        toApprove: r.autoMerge ? recs.filter((q) => q?.status === 'passed' && !q.approved).length : 0,
+        toMerge: r.autoMerge ? 0 : recs.filter((q) => q?.status === 'passed').length,
         stuck: recs.filter((q) => q?.status === 'needs-human').length,
         merged: r.pulls.filter((p) => p.state === 'MERGED').length,
       };
     });
-    const sum = (k: 'issues' | 'prs' | 'ready' | 'stuck' | 'inQa') => floors.reduce((n, f) => n + f[k], 0);
+    const sum = (k: 'issues' | 'prs' | 'ready' | 'stuck' | 'inQa' | 'toApprove' | 'toMerge') => floors.reduce((n, f) => n + f[k], 0);
     const pending = pendingRequests(requests).length;
 
     // The report: a few plain sentences, most urgent first.
     const report: { icon: string; text: string; tone?: 'good' | 'warn' }[] = [];
-    const readyList = floors.filter((f) => f.ready > 0);
+    const approveList = floors.filter((f) => f.toApprove > 0);
+    if (approveList.length)
+      report.push({
+        icon: '🔍',
+        text: `${sum('toApprove')} pull request${sum('toApprove') === 1 ? ' passed' : 's passed'} QA and ${sum('toApprove') === 1 ? 'waits' : 'wait'} for you to approve the QA report on the board (${approveList.map((f) => `${f.repo.fullName.split('/')[1]}: ${f.toApprove}`).join(', ')}). Nothing merges until you do.`,
+        tone: 'warn',
+      });
+    const readyList = floors.filter((f) => f.toMerge > 0);
     if (readyList.length)
       report.push({
         icon: '✅',
-        text: `${sum('ready')} pull request${sum('ready') === 1 ? ' passed' : 's passed'} QA and ${sum('ready') === 1 ? 'is' : 'are'} ready for you to merge (${readyList.map((f) => `${f.repo.fullName.split('/')[1]}: ${f.ready}`).join(', ')}).`,
+        text: `${sum('toMerge')} pull request${sum('toMerge') === 1 ? ' passed' : 's passed'} QA and ${sum('toMerge') === 1 ? 'is' : 'are'} ready for you to merge (${readyList.map((f) => `${f.repo.fullName.split('/')[1]}: ${f.toMerge}`).join(', ')}).`,
         tone: 'good',
       });
     if (sum('stuck')) report.push({ icon: '⚠️', text: `${sum('stuck')} pull request${sum('stuck') === 1 ? '' : 's'} failed QA three times and need${sum('stuck') === 1 ? 's' : ''} your call.`, tone: 'warn' });
@@ -323,8 +333,52 @@ function useCompany() {
   }, [repos, agents, qa, requests, settings, info]);
 }
 
+// ---------- productivity ----------
+
+const duration = (min: number) => {
+  if (min < 60) return `${Math.max(1, Math.round(min))}m`;
+  const h = Math.floor(min / 60);
+  if (h < 24) return `${h}h ${Math.round(min % 60)}m`;
+  return `${Math.floor(h / 24)}d ${h % 24}h`;
+};
+const percent = (x: number | null) => (x == null ? '–' : `${Math.round(x * 100)}%`);
+
+/** The week's numbers from the office's work log: throughput, cycle time, QA pass rate, cost and how busy the staff are. */
+function Productivity({ m }: { m: MetricsView }) {
+  const w = m.week;
+  const tiles: [string, string | number, string][] = [
+    ['🎉', w.merged, `merged this week (${m.day.merged} today)`],
+    ['📈', m.perDay ?? '–', 'merged per day'],
+    ['⏱', w.medianCycleMin == null ? '–' : duration(w.medianCycleMin), 'issue → merged (median)'],
+    ['🔍', percent(w.qaPassRate), `of ${w.qaRounds} QA round${w.qaRounds === 1 ? '' : 's'} passed`],
+    ['💵', w.costPerMerged == null ? '–' : `$${w.costPerMerged.toFixed(2)}`, 'cost per merged PR'],
+    ['🪑', percent(w.utilization), 'staff time busy'],
+  ];
+  return (
+    <>
+      <h3 className="phone-h">This week</h3>
+      <div className="tiles">
+        {tiles.map(([icon, value, label]) => (
+          <div key={icon} className="tile">
+            <div className="tile-value">
+              {icon} {value}
+            </div>
+            <div className="tile-label">{label}</div>
+          </div>
+        ))}
+      </div>
+      <div className="muted small productivity-note">
+        {m.since == null
+          ? 'These fill in as the team finishes work.'
+          : `From the office's work log since ${new Date(m.since).toLocaleDateString()}${w.avgQaRounds != null ? ` · ${w.avgQaRounds} QA rounds per merged PR` : ''} · $${w.costUsd.toFixed(2)} spent, CEO included.`}
+      </div>
+    </>
+  );
+}
+
 function Company() {
   const c = useCompany();
+  const metrics = useStore((s) => s.metrics);
   const goToFloor = useStore((s) => s.goToFloor);
   const tiles: [string, string | number, string][] = [
     ['🏢', c.floors.length, c.floors.length === 1 ? 'project' : 'projects'],
@@ -354,6 +408,7 @@ function Company() {
           </li>
         ))}
       </ul>
+      {metrics && c.floors.length > 0 && <Productivity m={metrics} />}
       {c.floors.length > 0 && <h3 className="phone-h">Projects</h3>}
       {c.floors.map((f) => (
         <div key={f.repo.id} className="proj" style={{ ['--accent' as string]: f.repo.color }}>
