@@ -270,20 +270,30 @@ function useCompany() {
         prs: r.pulls.filter((p) => p.state === 'OPEN').length,
         inQa: recs.filter((q) => q && q.status !== 'passed' && q.status !== 'needs-human').length,
         ready: recs.filter((q) => q?.status === 'passed').length,
+        // Auto-merge floors wait for the manager to approve QA's report; the others wait for the manager to merge.
+        toApprove: r.autoMerge ? recs.filter((q) => q?.status === 'passed' && !q.approved).length : 0,
+        toMerge: r.autoMerge ? 0 : recs.filter((q) => q?.status === 'passed').length,
         stuck: recs.filter((q) => q?.status === 'needs-human').length,
         merged: r.pulls.filter((p) => p.state === 'MERGED').length,
       };
     });
-    const sum = (k: 'issues' | 'prs' | 'ready' | 'stuck' | 'inQa') => floors.reduce((n, f) => n + f[k], 0);
+    const sum = (k: 'issues' | 'prs' | 'ready' | 'stuck' | 'inQa' | 'toApprove' | 'toMerge') => floors.reduce((n, f) => n + f[k], 0);
     const pending = pendingRequests(requests).length;
 
     // The report: a few plain sentences, most urgent first.
     const report: { icon: string; text: string; tone?: 'good' | 'warn' }[] = [];
-    const readyList = floors.filter((f) => f.ready > 0);
+    const approveList = floors.filter((f) => f.toApprove > 0);
+    if (approveList.length)
+      report.push({
+        icon: '🔍',
+        text: `${sum('toApprove')} pull request${sum('toApprove') === 1 ? ' passed' : 's passed'} QA and ${sum('toApprove') === 1 ? 'waits' : 'wait'} for you to approve the QA report on the board (${approveList.map((f) => `${f.repo.fullName.split('/')[1]}: ${f.toApprove}`).join(', ')}). Nothing merges until you do.`,
+        tone: 'warn',
+      });
+    const readyList = floors.filter((f) => f.toMerge > 0);
     if (readyList.length)
       report.push({
         icon: '✅',
-        text: `${sum('ready')} pull request${sum('ready') === 1 ? ' passed' : 's passed'} QA and ${sum('ready') === 1 ? 'is' : 'are'} ready for you to merge (${readyList.map((f) => `${f.repo.fullName.split('/')[1]}: ${f.ready}`).join(', ')}).`,
+        text: `${sum('toMerge')} pull request${sum('toMerge') === 1 ? ' passed' : 's passed'} QA and ${sum('toMerge') === 1 ? 'is' : 'are'} ready for you to merge (${readyList.map((f) => `${f.repo.fullName.split('/')[1]}: ${f.toMerge}`).join(', ')}).`,
         tone: 'good',
       });
     if (sum('stuck')) report.push({ icon: '⚠️', text: `${sum('stuck')} pull request${sum('stuck') === 1 ? '' : 's'} failed QA three times and need${sum('stuck') === 1 ? 's' : ''} your call.`, tone: 'warn' });

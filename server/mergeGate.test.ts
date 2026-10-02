@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { CHECKS_ALERT_MS, MAX_MERGE_FIXES, mergeStep, type MergePull, type MergeRecord } from './mergeGate.ts';
+import { carryApproval, CHECKS_ALERT_MS, MAX_MERGE_FIXES, mergeStep, WAITING_FOR_MANAGER, type MergePull, type MergeRecord } from './mergeGate.ts';
 
 const NOW = 1_800_000_000_000;
 const base = { base: 'main' };
@@ -17,6 +17,7 @@ const pull = (p: Partial<MergePull> = {}): MergePull => ({
 
 const record = (r: Partial<MergeRecord> = {}): MergeRecord => ({
   passedSha: 'abc123',
+  approvedSha: 'abc123', // the manager approved QA's report; see 'the manager's approval' below
   mergeFixes: 0,
   pendingSince: null,
   mergeRetryAt: null,
@@ -68,7 +69,7 @@ describe('mergeStep', () => {
     });
 
     it('adopts the head as the passed commit for records from before commits were tracked', () => {
-      expect(mergeStep(pull({ headSha: 'def789' }), record({ passedSha: null }), NOW, base)).toEqual({
+      expect(mergeStep(pull({ headSha: 'def789' }), record({ passedSha: null, approvedSha: 'def789' }), NOW, base)).toEqual({
         do: 'merge',
         set: { passedSha: 'def789', pendingSince: null },
       });
@@ -179,5 +180,41 @@ describe('mergeStep', () => {
     it('still updates a branch that fell behind while waiting', () => {
       expect(mergeStep(pull({ mergeState: 'BEHIND' }), record({ mergeRetryAt: NOW + 60_000 }), NOW, base).do).toBe('update-branch');
     });
+  });
+});
+
+describe("the manager's approval", () => {
+  it('waits for the manager once QA passed and the checks are green', () => {
+    expect(mergeStep(pull(), record({ approvedSha: null }), NOW, base)).toEqual({ do: 'wait', note: WAITING_FOR_MANAGER, set: { pendingSince: null } });
+    expect(mergeStep(pull({ mergeState: 'BEHIND' }), record({ approvedSha: null }), NOW, base).do).toBe('wait');
+  });
+
+  it('does not count an approval of an older commit', () => {
+    expect(mergeStep(pull(), record({ approvedSha: 'older' }), NOW, base)).toMatchObject({ do: 'wait', note: WAITING_FOR_MANAGER });
+  });
+
+  it('needs an approval for a PR signed off before the office tracked commits', () => {
+    expect(mergeStep(pull(), record({ passedSha: null, approvedSha: null }), NOW, base)).toMatchObject({ do: 'wait', note: WAITING_FOR_MANAGER });
+  });
+
+  it('still sends back conflicts and failing checks, and waits on running checks, before the approval', () => {
+    expect(mergeStep(pull({ mergeable: 'CONFLICTING' }), record({ approvedSha: null }), NOW, base).do).toBe('send-back');
+    expect(mergeStep(pull({ checks: 'failing' }), record({ approvedSha: null }), NOW, base).do).toBe('send-back');
+    expect(mergeStep(pull({ checks: 'pending', pendingChecks: ['ci'] }), record({ approvedSha: null }), NOW, base)).toMatchObject({ do: 'wait', note: 'waiting for checks: ci' });
+  });
+
+  it('re-tests new commits whatever was approved', () => {
+    expect(mergeStep(pull({ headSha: 'new' }), record(), NOW, base).do).toBe('requeue');
+  });
+});
+
+describe('carryApproval', () => {
+  it('moves an approval of the passed commit to the new commit', () => {
+    expect(carryApproval({ passedSha: 'a', approvedSha: 'a' }, 'b')).toBe('b');
+  });
+
+  it('never creates an approval or moves a stale one', () => {
+    expect(carryApproval({ passedSha: 'a', approvedSha: null }, 'b')).toBeNull();
+    expect(carryApproval({ passedSha: 'a', approvedSha: 'older' }, 'b')).toBe('older');
   });
 });

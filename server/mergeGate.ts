@@ -1,14 +1,21 @@
 import type { PullInfo } from '../shared/types.ts';
 
 // Auto-merge: fixes for failing checks or conflicts before a PR needs the manager, how long checks may run before
-// the manager hears about it, and how long to wait before retrying a merge GitHub refused.
+// the manager hears about it, and how long to wait before retrying a merge GitHub refused. Nothing merges until the
+// manager has checked QA's report and approved the commit QA passed.
 export const MAX_MERGE_FIXES = 3;
 export const CHECKS_ALERT_MS = 30 * 60_000;
 export const MERGE_RETRY_MS = 10 * 60_000;
+export const WAITING_FOR_MANAGER = 'checks are green: waiting for the manager to approve the QA report';
+
+/** Where the manager's approval goes when the office moves a QA-passed PR to a new commit with no code of its own. */
+export const carryApproval = (rec: Pick<MergeRecord, 'passedSha' | 'approvedSha'>, newSha: string) =>
+  rec.approvedSha != null && rec.approvedSha === rec.passedSha ? newSha : rec.approvedSha;
 
 /** The parts of a QA record the merge gate reads. */
 export interface MergeRecord {
   passedSha: string | null;
+  approvedSha: string | null; // the commit whose QA report the manager approved
   mergeFixes: number;
   pendingSince: number | null;
   mergeRetryAt: number | null;
@@ -57,6 +64,7 @@ export function mergeStep(pr: MergePull, rec: MergeRecord, now: number, opts: { 
   }
   set.pendingSince = null;
   if (pr.mergeable === 'UNKNOWN') return { do: 'wait', note: 'GitHub is checking it can merge', set };
+  if (rec.approvedSha == null || rec.approvedSha !== (set.passedSha ?? rec.passedSha)) return { do: 'wait', note: WAITING_FOR_MANAGER, set };
   if (pr.mergeState === 'BEHIND') return { do: 'update-branch', set };
   if (rec.mergeRetryAt && now < rec.mergeRetryAt) return { do: 'wait', set };
   return { do: 'merge', set };

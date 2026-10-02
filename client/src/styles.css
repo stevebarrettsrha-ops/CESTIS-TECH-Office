@@ -2872,3 +2872,16 @@ input.inline:focus {
 .focus-card-keys kbd {
   color: var(--ink);
 }
+
+/* The QA report in the manager's approval box */
+.qa-approve p {
+  margin: 0 0 8px;
+}
+.qa-approve-checks {
+  margin: 0 0 8px;
+  padding-left: 0;
+  list-style: none;
+  max-height: 180px;
+  overflow-y: auto;
+  text-align: left;
+}

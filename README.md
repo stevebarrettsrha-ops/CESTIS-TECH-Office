@@ -85,7 +85,7 @@ To get the short command `cestis-office` anywhere on your machine, run `npm link
 1. **Set up your company.** A short wizard asks your name, fills in C.E.S.T.I.S TECHNICAL SERVICES as the company name, and introduces your CEO. You choose the CEO's staff shirt colour.
 2. **Move in a project.** Pick one of your project folders or a GitHub repo, or start a new blank repo. Each project gets its own floor. Every project needs to be on GitHub, because issues and pull requests are how the team works.
 3. **Let the CEO plan.** The CEO studies the project, writes its QA checklist, plans the work as GitHub issues and proposes who to hire. Press `P` for your phone to chat with them and approve hires. New hires get their staff shirt and badge.
-4. **Watch the work.** Developers pick up issues and open pull requests. QA testers review and test each one in a real browser, then post a report with screenshots. With auto-merge on, a pull request merges once QA passes and GitHub's checks are green, and the office celebrates.
+4. **Watch the work.** Developers pick up issues and open pull requests. QA testers review and test each one in a real browser, then post a report with screenshots. Your phone tells you when one passes QA: check QA's report and press **Approve QA** on the board. With auto-merge on, it then merges once GitHub's checks are green, and the office celebrates. Nothing merges without your approval.
 
 ## Controls
 
@@ -131,7 +131,7 @@ To make changes and improve it further, see [CONTRIBUTING.md](CONTRIBUTING.md). 
 ## Good to know
 
 - **It runs on your coding agents' subscriptions.** Agents on the same coding agent share the same usage limits. To cap how many work at once, set a session limit in the manager's console.
-- **Agents work on your machine, like your own coding agents**: with your skills, MCP servers and settings, each in its own copy of the repo. They don't push to your main branch or merge. The office merges, after QA.
+- **Agents work on your machine, like your own coding agents**: with your skills, MCP servers and settings, each in its own copy of the repo. They don't push to your main branch or merge. The office merges, after QA and your approval.
 - **Your office lives in `~/.cestis-office`**: settings, clones of your repos and one working copy per agent. Set `SWARM_HOME` to use another folder.
 
 ## Learn more

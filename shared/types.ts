@@ -222,6 +222,7 @@ export interface QaView {
   checks: QaCheck[];
   commentUrl: string | null; // the PR comment with the latest QA report
   mergeNote: string | null; // where auto-merge stands once QA passed, e.g. "waiting for checks: Vercel"
+  approved: boolean; // the manager approved QA's report on the commit QA passed: auto-merge may merge it
   updatedAt: number;
 }
 

@@ -113,6 +113,40 @@ export function KanbanView({ repoId }: { repoId: string }) {
     );
     if (ok) void act(c.key, () => api.mergePull(repo.id, c.number));
   };
+  // Auto-merge only merges what the manager approved: they read QA's verdict here before it goes in.
+  const approve = async (c: KanbanCard) => {
+    const qa = c.qa;
+    const ok = await confirmDialog({
+      icon: '🔍',
+      tone: 'good',
+      title: `Approve QA of PR #${c.number}?`,
+      body: (
+        <div className="qa-approve">
+          <p>“{c.title}”</p>
+          {qa?.summary && <p>{qa.summary}</p>}
+          {qa && qa.checks.length > 0 && (
+            <ul className="qa-approve-checks">
+              {qa.checks.map((k, i) => (
+                <li key={i} title={k.details}>
+                  {k.result === 'pass' ? '✅' : k.result === 'fail' ? '❌' : '➖'} {k.name}
+                </li>
+              ))}
+            </ul>
+          )}
+          {qa?.commentUrl && (
+            <p>
+              <a href={qa.commentUrl} target="_blank" rel="noreferrer">
+                Full QA report with screenshots ↗
+              </a>
+            </p>
+          )}
+          <p className="muted small">Once approved, it merges into {repo.defaultBranch} as soon as GitHub's checks are green.</p>
+        </div>
+      ),
+      confirm: 'Approve',
+    });
+    if (ok) void act(c.key, () => api.approveQa(repo.id, c.number));
+  };
   const previewButton = (c: KanbanCard) => (
     <button
       className="btn btn-small"
@@ -180,9 +214,9 @@ export function KanbanView({ repoId }: { repoId: string }) {
           <input type="checkbox" checked={repo.autoAssign} onChange={(e) => void api.updateRepo(repo.id, { autoAssign: e.target.checked }).catch(() => undefined)} />
           ⚡ Auto-assign backlog to free developers
         </label>
-        <label className="toggle" title="Merge a PR as soon as QA has signed off on its latest commit and GitHub's checks are green">
+        <label className="toggle" title="Merge a PR once QA has signed off on its latest commit, you have approved QA's report, and GitHub's checks are green">
           <input type="checkbox" checked={repo.autoMerge} onChange={(e) => void api.updateRepo(repo.id, { autoMerge: e.target.checked }).catch(() => undefined)} />
-          🔀 Auto-merge when QA and checks pass
+          🔀 Auto-merge once you approve QA and checks pass
         </label>
         <span className="spacer" />
         <button className="btn" onClick={() => openOverlay({ kind: 'app', repoId: repo.id })} title="Open this floor's running app">
@@ -279,7 +313,17 @@ export function KanbanView({ repoId }: { repoId: string }) {
                 <span className="spacer" />
                 <QaLink card={c} />
                 {previewButton(c)}
-                <button className="btn btn-small btn-good" disabled={pending === c.key || pr?.isDraft} onClick={() => merge(c)}>
+                {repo.autoMerge && c.qa?.status === 'passed' && !c.qa.approved && (
+                  <button className="btn btn-small btn-good" disabled={pending === c.key} title="Read QA's report and approve it: auto-merge waits for you" onClick={() => approve(c)}>
+                    Approve QA
+                  </button>
+                )}
+                {repo.autoMerge && c.qa?.approved && <span className="chip chip-good">👍 approved</span>}
+                <button
+                  className={`btn btn-small ${repo.autoMerge && c.qa?.status === 'passed' ? '' : 'btn-good'}`}
+                  disabled={pending === c.key || pr?.isDraft}
+                  onClick={() => merge(c)}
+                >
                   Merge
                 </button>
                 <button

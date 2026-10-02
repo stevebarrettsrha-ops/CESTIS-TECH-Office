@@ -8,7 +8,7 @@ import type { PrDetails } from './github.ts';
 import { defaultProjectsDir, EVENTS_FILE, HOME_DIR, LOG_BUFFER, SCHEDULER_INTERVAL_MS, STATE_FILE, SYNC_INTERVAL_MS, WORKSPACE_ROOT } from './config.ts';
 import { ceoJobPrompt, ceoSystemPrompt, createOfficeTools, IssueCap, jobLabel, planRoute, specialtyLabel, specialtySlug, type CeoJob, type OfficeTools } from './ceo.ts';
 import { HttpError } from './httpError.ts';
-import { CHECKS_ALERT_MS, MAX_MERGE_FIXES, MERGE_RETRY_MS, mergeStep } from './mergeGate.ts';
+import { carryApproval, CHECKS_ALERT_MS, MAX_MERGE_FIXES, MERGE_RETRY_MS, mergeStep } from './mergeGate.ts';
 import { DEFAULT_PREVIEW, Previews, parsePreviewPatch } from './previews.ts';
 import { drainDecision, lastUpdateMessage, POSTPONE_MS, type DrainInput, type LastUpdate } from './officeUpdate.ts';
 import { clampPacingSessions, DEFAULT_PACING_SESSIONS, mayStart, PACING_MS, pacingMessage, usageLabel, usageView, type UsageWarning, type WorkKind } from './pacing.ts';
@@ -109,7 +109,7 @@ interface PersistedAgent {
 }
 
 /** A pull request's trip through QA. */
-interface QaRecord extends QaView {
+interface QaRecord extends Omit<QaView, 'approved'> {
   issueNumber: number | null;
   authorId: string | null; // the developer who opened it (devAgentId moves to whoever fixes it)
   devSessionId: string | null; // the dev's Claude Code session, resumed to fix QA findings
@@ -118,6 +118,7 @@ interface QaRecord extends QaView {
   testedSha: string | null; // the head commit QA is testing
   checkedSha: string | null; // the head QA last gave a verdict on: a re-test looks at what changed since (rework.ts)
   passedSha: string | null; // the head commit QA signed off on: auto-merge merges exactly that
+  approvedSha: string | null; // the commit whose QA report the manager approved: auto-merge waits for it to match
   fixReason: 'qa' | 'checks' | 'conflict' | null; // why it was last sent back to a developer
   mergeFixes: number; // times it went back for failing checks or conflicts
   retests: number; // QA rounds caused by merge fixes or new commits rather than by QA failing it
@@ -475,6 +476,7 @@ export class Swarm {
           testedSha: q.testedSha ?? null,
           checkedSha: q.checkedSha ?? null,
           passedSha: q.passedSha ?? null,
+          approvedSha: q.approvedSha ?? null,
           fixReason: q.fixReason ?? null,
           mergeFixes: q.mergeFixes ?? 0,
           retests: q.retests ?? 0,
@@ -696,6 +698,7 @@ export class Swarm {
       checks: q.checks,
       commentUrl: q.commentUrl,
       mergeNote: q.mergeNote,
+      approved: q.status === 'passed' && q.passedSha != null && q.approvedSha === q.passedSha,
       updatedAt: q.updatedAt,
     };
   }
@@ -1054,7 +1057,7 @@ export class Swarm {
       // checks on the new head decide, as after the office's own branch update. Anything else gets tested too.
       const clean = rec.passedSha ? await this.backend.cleanMergesSince(repo.fullName, pr.number, rec.passedSha, repo.defaultBranch) : null;
       if (clean && clean === pr.headSha) {
-        this.setQa(rec, { passedSha: clean, pendingSince: null, mergeNote: `only clean merges of ${repo.defaultBranch} since QA: no re-test` });
+        this.setQa(rec, { passedSha: clean, approvedSha: carryApproval(rec, clean), pendingSince: null, mergeNote: `only clean merges of ${repo.defaultBranch} since QA: no re-test` });
         return false;
       }
       this.setQa(rec, { status: 'queued', round: rec.round + 1, retests: rec.retests + 1, mergeNote: null, pendingSince: null });
@@ -1073,7 +1076,7 @@ export class Swarm {
       this.mergeNote(rec, `updating the branch with ${repo.defaultBranch}`);
       await this.backend.updateBranch(repo.fullName, pr.number);
       const details = await this.backend.prDetails(repo.fullName, pr.number);
-      this.setQa(rec, { passedSha: details.headSha });
+      this.setQa(rec, { passedSha: details.headSha, approvedSha: carryApproval(rec, details.headSha) });
       return false;
     }
     if (step.do !== 'merge') return false;
@@ -1960,6 +1963,7 @@ export class Swarm {
         testedSha: null,
         checkedSha: null,
         passedSha: null,
+        approvedSha: null,
         fixReason: null,
         mergeFixes: 0,
         retests: 0,
@@ -1971,6 +1975,16 @@ export class Swarm {
       this.setQa(rec, {});
     }
     setTimeout(() => this.schedule(), 200);
+  }
+
+  /** The manager checked QA's report on a passed PR and approves it: auto-merge may merge that exact commit. */
+  approveQa(repoId: string, prNumber: number) {
+    const repo = this.repo(repoId);
+    const rec = this.state.qa.find((q) => q.repoId === repo.id && q.prNumber === prNumber);
+    if (!rec || rec.status !== 'passed' || !rec.passedSha) throw new HttpError(409, `PR #${prNumber} hasn't passed QA, so there is no QA report to approve yet`);
+    this.setQa(rec, { approvedSha: rec.passedSha, mergeNote: repo.autoMerge ? "approved: merges once GitHub's checks are green" : 'approved' });
+    this.toast('success', `👍 Approved PR #${prNumber}${repo.autoMerge ? "; it merges once GitHub's checks are green" : ''}`);
+    void this.syncRepo(repo.id);
   }
 
   /** Manager's "send to QA" for any open PR (including ones opened by people). */
@@ -2139,11 +2153,14 @@ export class Swarm {
       this.toast(
         pass ? 'success' : 'error',
         pass
-          ? `✅ ${a.name} passed PR #${rec.prNumber}${repo.autoMerge ? "; it merges once GitHub's checks are green" : ': ready to merge'}`
+          ? `✅ ${a.name} passed PR #${rec.prNumber}${repo.autoMerge ? ': check the QA report and approve it on the board to merge it' : ': ready to merge'}`
           : nextStatus === 'needs-human'
             ? `❌ PR #${rec.prNumber} failed QA ${qaRounds} times and needs a human`
             : `❌ ${a.name} failed PR #${rec.prNumber}; sending it back to the developer`,
       );
+      if (pass && repo.autoMerge) {
+        this.postMessage('office', `✅ PR #${rec.prNumber} on ${repo.fullName} passed QA. Check the QA report and approve it on floor ${repo.floor}'s board: it merges only after you do.`);
+      }
     }
   }
 
@@ -2182,7 +2199,7 @@ export class Swarm {
     if (!pass && report.fixInstructions) lines.push('', '### 🔧 What needs fixing', '', report.fixInstructions);
     if (images.length) lines.push('', '### 📸 Evidence', '', ...images.flatMap((img) => [img, '']));
     else lines.push('', '_No browser screenshots were taken in this round._');
-    const merge = repo.autoMerge ? "merges automatically once GitHub's checks pass" : 'ready for the manager to merge';
+    const merge = repo.autoMerge ? "merges once the manager approves this report and GitHub's checks pass" : 'ready for the manager to merge';
     lines.push('', `<sub>Posted by C.E.S.T.I.S Office · ${pass ? merge : rec.round - rec.retests >= MAX_QA_ROUNDS ? 'needs a human decision' : 'sent back to the developer for fixes'}</sub>`);
     return lines.join('\n');
   }
