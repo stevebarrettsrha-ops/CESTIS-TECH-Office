@@ -3,7 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import type { WebSocket } from 'ws';
 import type { Backend } from './backend.ts';
-import type { LogEntry, SessionHandle, SessionResult } from './agentRunner.ts';
+import type { LogEntry, SessionCallbacks, SessionHandle, SessionResult } from './agentRunner.ts';
 import type { PrDetails } from './github.ts';
 import { defaultProjectsDir, EVENTS_FILE, HOME_DIR, LOG_BUFFER, SCHEDULER_INTERVAL_MS, STATE_FILE, SYNC_INTERVAL_MS, WORKSPACE_ROOT } from './config.ts';
 import { ceoJobPrompt, ceoSystemPrompt, createOfficeTools, IssueCap, jobLabel, planRoute, specialtyLabel, specialtySlug, type CeoJob, type OfficeTools } from './ceo.ts';
@@ -15,6 +15,7 @@ import { clampPacingSessions, DEFAULT_PACING_SESSIONS, mayStart, PACING_MS, paci
 import { isCli } from './clis.ts';
 import { metricsView, WorkLog, type WorkEvent } from './metrics.ts';
 import { STOPPED_RELEASE_MS, stoppedDue } from './stopped.ts';
+import { STALL_STOP_MS, STALL_WARN_MS, stallAction } from './watchdog.ts';
 import { AgentTerminal } from './terminal.ts';
 import { blockers, holdUps, issueSpecialty } from '../shared/issues.ts';
 import { effectiveModel } from '../shared/models.ts';
@@ -163,6 +164,7 @@ interface AgentRuntime {
   screenshot: { data: Buffer; mime: string; at: number } | null;
   shots: Shot[]; // every screenshot of the current session (QA evidence)
   terminal: AgentTerminal | null; // their terminal, once they've run in the terminal runtime
+  watch?: { seenAt: number; warned: boolean; stalled: boolean }; // the running session, for the watchdog (watchdog.ts)
 }
 
 interface RepoRuntime {
@@ -1491,6 +1493,54 @@ export class Swarm {
     this.save();
   }
 
+  /** A session's callbacks, with every report it makes counted as a sign of work for the watchdog. */
+  private watched(rt: AgentRuntime, cb: SessionCallbacks): SessionCallbacks {
+    const watch = { seenAt: Date.now(), warned: false, stalled: false };
+    rt.watch = watch;
+    const seen = () => {
+      watch.seenAt = Date.now();
+    };
+    return {
+      ...cb,
+      log: (entries) => (seen(), cb.log(entries)),
+      tool: (name) => (seen(), cb.tool(name)),
+      sessionId: (id) => (seen(), cb.sessionId(id)),
+      browserUrl: (url) => (seen(), cb.browserUrl(url)),
+      screenshot: (data, mime) => (seen(), cb.screenshot(data, mime)),
+      turn: cb.turn && ((text) => (seen(), cb.turn!(text))),
+    };
+  }
+
+  /** Warn about sessions that have gone quiet, and stop the ones that stayed quiet (watchdog.ts). */
+  private watchSessions() {
+    const now = Date.now();
+    for (const a of this.state.agents) {
+      const rt = this.agentRt.get(a.id);
+      const watch = rt?.watch;
+      if (!rt?.session || !watch || watch.stalled || !BUSY.includes(a.status)) continue;
+      const lastSeen = Math.max(watch.seenAt, rt.terminal?.lastOutputAt ?? 0);
+      const action = stallAction(now, lastSeen, watch.warned);
+      if (!action) {
+        if (now - lastSeen < STALL_WARN_MS) watch.warned = false; // back at work: a later quiet spell is warned about again
+        continue;
+      }
+      const on = a.role === 'ceo' ? '' : a.task === 'qa' ? ` testing PR #${a.prNumber}` : a.task === 'fix' ? ` fixing PR #${a.prNumber}` : a.issueNumber ? ` on #${a.issueNumber}` : '';
+      if (action === 'warn') {
+        watch.warned = true;
+        const mins = Math.round(STALL_WARN_MS / 60_000);
+        this.appendLog(a, [{ kind: 'error', text: `⏱ No sign of work for ${mins} minutes. The office stops this session at ${Math.round(STALL_STOP_MS / 60_000)} minutes unless it carries on.` }]);
+        this.postMessage('office', `⏱ ${a.name} has shown no sign of work for ${mins} minutes${on}. Their terminal may be waiting for an answer; the office stops the session in ${Math.round((STALL_STOP_MS - STALL_WARN_MS) / 60_000)} minutes if nothing changes.`);
+        continue;
+      }
+      watch.stalled = true;
+      const mins = Math.round(STALL_STOP_MS / 60_000);
+      this.appendLog(a, [{ kind: 'error', text: `⏱ No sign of work for ${mins} minutes: stopping the session.` }]);
+      const next = a.role === 'ceo' ? '' : ' The work goes back to the queue.';
+      this.postMessage('office', `⏱ ${a.name} showed no sign of work for ${mins} minutes${on}, so the office stopped the session.${next}`);
+      rt.session.stop();
+    }
+  }
+
   /** Agents stopped for a while go back to the pool and let go of their issue (stopped.ts). */
   private releaseStopped() {
     const staff = this.state.agents.filter((a) => a.role !== 'ceo');
@@ -1739,7 +1789,7 @@ export class Swarm {
         agentId: a.id,
         ...how,
       },
-      {
+      this.watched(rt, {
         log: (entries) => this.appendLog(a, entries),
         tool: (name) => {
           if (rt.currentTool === name) return;
@@ -1768,7 +1818,7 @@ export class Swarm {
         limited: (at) => this.pauseForLimit(at),
         usageWarning: (info) => this.paceForWarning(info),
         finished: (result) => void this.onFinished(a, repo, result),
-      },
+      }),
     );
   }
 
@@ -1776,6 +1826,7 @@ export class Swarm {
     const rt = this.agentRt.get(a.id);
     if (!rt || !this.state.agents.includes(a)) return; // fired
     if (this.officeUpdate.handedOver) return; // stopped for the office's update: recovered like after a restart
+    result = this.stallResult(rt, result);
     rt.session = null;
     rt.currentTool = null;
     a.endedAt = Date.now();
@@ -1794,6 +1845,14 @@ export class Swarm {
     this.save();
     void this.syncRepo(repo.id);
     setTimeout(() => this.schedule(), 500);
+  }
+
+  /** A session the watchdog stopped ends as a failure, so its work is retried (and counted against the issue). */
+  private stallResult(rt: AgentRuntime, result: SessionResult): SessionResult {
+    const stalled = rt.watch?.stalled;
+    rt.watch = undefined;
+    if (!stalled) return result;
+    return { ...result, ok: false, interrupted: false, errors: [`No sign of work for ${Math.round(STALL_STOP_MS / 60_000)} minutes, so the office stopped the session`] };
   }
 
   private recordSession(a: PersistedAgent, result: SessionResult) {
@@ -2440,6 +2499,7 @@ export class Swarm {
    */
   private schedule() {
     this.tickUsage();
+    this.watchSessions();
     this.releaseStopped();
     if (this.officeUpdateTick()) return; // draining for the office's own update
     if (this.limited()) return;
@@ -2766,7 +2826,7 @@ export class Swarm {
         office: this.officeTools(),
         ...how,
       },
-      {
+      this.watched(rt, {
         log: (entries) => this.appendLog(a, entries),
         tool: (name) => {
           if (rt.currentTool === name) return;
@@ -2783,13 +2843,14 @@ export class Swarm {
         limited: (at) => this.pauseForLimit(at),
         usageWarning: (info) => this.paceForWarning(info),
         finished: (result) => this.onCeoFinished(a, result),
-      },
+      }),
     );
   }
 
   private onCeoFinished(a: PersistedAgent, result: SessionResult) {
     const rt = this.agentRt.get(a.id);
     if (!rt || this.officeUpdate.handedOver) return;
+    result = this.stallResult(rt, result);
     rt.session = null;
     rt.currentTool = null;
     a.endedAt = Date.now();

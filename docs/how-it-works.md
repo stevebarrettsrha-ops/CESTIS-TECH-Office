@@ -37,6 +37,8 @@ You can message an agent at any time. While they're working, the message is inje
 
 An agent you stop (or interrupt with Esc in their terminal, or one the office stopped for a restart or an update) keeps its task for 30 minutes, so you can carry on in their terminal or message them. After that it goes back to the pool for new work and lets go of its issue, and your phone says so.
 
+A session that shows no sign of work (nothing new in its log and nothing printed in its terminal) is probably stuck: waiting on a question nobody answers, a setup screen, or a dev server it left running in the foreground. After 20 quiet minutes your phone says so; after 30 the office stops the session and treats it as failed. The agent sits out the usual 2-minute cooldown, and the work goes back to the queue (an issue that fails twice is no longer picked up automatically).
+
 ## Productivity
 
 The phone's **Company** tab shows the week at a glance:

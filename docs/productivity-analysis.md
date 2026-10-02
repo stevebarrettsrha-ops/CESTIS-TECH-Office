@@ -153,7 +153,7 @@ agent idle and busy time, cost per merged PR, and time lost to pacing, pauses an
 ## 6. Recommended order of work
 
 1. ✅ **Measure first:** add the event log and metrics view from §4, and fix the developer credit and the 8-PR cap. *Done: `server/metrics.ts`, the phone's "This week" section, and merge credit from the QA record.*
-2. **Recover lost capacity:** return `stopped` agents to the pool (§3.1) and add a session watchdog (§3.6). *The first half is done (`server/stopped.ts`); the watchdog is still to do.*
+2. ✅ **Recover lost capacity:** return `stopped` agents to the pool (§3.1) and add a session watchdog (§3.6). *Done: `server/stopped.ts` and `server/watchdog.ts`.*
 3. **Cut rework:** scope re-tests to the change, and skip QA for clean main merges with green CI (§3.2).
 4. **Speed up merging:** use a faster merge loop while PRs are waiting, or GitHub auto-merge (§3.3).
 5. **Pace smarter:** count only issue sessions toward the cap (§3.4), and batch self-updates (§3.5).
