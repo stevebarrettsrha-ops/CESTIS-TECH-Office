@@ -6,7 +6,14 @@ import type { PullInfo } from '../shared/types.ts';
 export const MAX_MERGE_FIXES = 3;
 export const CHECKS_ALERT_MS = 30 * 60_000;
 export const MERGE_RETRY_MS = 10 * 60_000;
+/** How often PRs that can merge without anyone (QA passed, approved, no retry pending) are looked at between syncs. */
+export const MERGE_POLL_MS = 10_000;
 export const WAITING_FOR_MANAGER = 'checks are green: waiting for the manager to approve the QA report';
+
+/** Can this QA record get to a merge without anyone's help, so it's worth looking at its PR more often than a sync? */
+export function readyToMerge(rec: Pick<MergeRecord, 'passedSha' | 'approvedSha' | 'mergeRetryAt'> & { status: string }, now: number): boolean {
+  return rec.status === 'passed' && rec.passedSha != null && rec.approvedSha === rec.passedSha && !(rec.mergeRetryAt && now < rec.mergeRetryAt);
+}
 
 /** Where the manager's approval goes when the office moves a QA-passed PR to a new commit with no code of its own. */
 export const carryApproval = (rec: Pick<MergeRecord, 'passedSha' | 'approvedSha'>, newSha: string) =>

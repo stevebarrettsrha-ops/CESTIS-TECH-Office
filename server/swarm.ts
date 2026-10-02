@@ -8,7 +8,7 @@ import type { PrDetails } from './github.ts';
 import { defaultProjectsDir, EVENTS_FILE, HOME_DIR, LOG_BUFFER, SCHEDULER_INTERVAL_MS, STATE_FILE, SYNC_INTERVAL_MS, WORKSPACE_ROOT } from './config.ts';
 import { ceoJobPrompt, ceoSystemPrompt, createOfficeTools, IssueCap, jobLabel, planRoute, specialtyLabel, specialtySlug, type CeoJob, type OfficeTools } from './ceo.ts';
 import { HttpError } from './httpError.ts';
-import { carryApproval, CHECKS_ALERT_MS, MAX_MERGE_FIXES, MERGE_RETRY_MS, mergeStep } from './mergeGate.ts';
+import { carryApproval, CHECKS_ALERT_MS, MAX_MERGE_FIXES, MERGE_POLL_MS, MERGE_RETRY_MS, mergeStep, readyToMerge } from './mergeGate.ts';
 import { DEFAULT_PREVIEW, Previews, parsePreviewPatch } from './previews.ts';
 import { drainDecision, lastUpdateMessage, POSTPONE_MS, type DrainInput, type LastUpdate } from './officeUpdate.ts';
 import { clampPacingSessions, DEFAULT_PACING_SESSIONS, mayStart, PACING_MS, pacingMessage, usageLabel, usageView, type UsageWarning, type WorkKind } from './pacing.ts';
@@ -182,6 +182,7 @@ interface RepoRuntime {
   lastMergedAt: string | null; // newest merge seen: a newer one means the folder needs a sync
   folderSync: string | null;
   merging: boolean;
+  mergePolledAt?: number; // when PRs ready to merge were last looked at between syncs (pollMerges)
 }
 
 interface QaReport {
@@ -1047,19 +1048,23 @@ export class Swarm {
    * checks are green. Failing checks and merge conflicts go back to a developer; new commits after QA's sign-off send
    * it back to QA. Merging deletes the remote branch, and the floor's folder then fast-forwards (syncRepo sees the merge).
    */
-  private async advanceMerges(repo: PersistedRepo) {
+  private async advanceMerges(repo: PersistedRepo, pulls?: PullInfo[], fetchedAt?: number) {
     const rt = this.repoRt.get(repo.id);
     if (!rt || !repo.autoMerge || rt.merging) return;
     rt.merging = true;
     let merged = false;
     try {
       for (const rec of this.state.qa.filter((q) => q.repoId === repo.id && q.status === 'passed')) {
-        const pr = rt.pulls.find((p) => p.number === rec.prNumber && p.state === 'OPEN');
+        const pr = (pulls ?? rt.pulls).find((p) => p.number === rec.prNumber && p.state === 'OPEN');
         if (!pr || !pr.headRefName.startsWith('swarm/')) continue; // people's own PRs are theirs to merge
         // Only act on PR data fetched after the record last changed (a fix may have just pushed).
-        if ((rt.fetchedAt ?? 0) < rec.updatedAt) continue;
+        if ((fetchedAt ?? rt.fetchedAt ?? 0) < rec.updatedAt) continue;
         try {
-          if (await this.advanceMerge(repo, rec, pr)) merged = true;
+          // After a merge the others' data is stale (they may be behind or conflict now): a fresh sync goes on with them.
+          if (await this.advanceMerge(repo, rec, pr)) {
+            merged = true;
+            break;
+          }
         } catch (err) {
           console.warn(`auto-merge of ${repo.fullName}#${pr.number} failed`, err);
           this.mergeNote(rec, `auto-merge hit a problem: ${oneLine(err)}`);
@@ -1071,6 +1076,29 @@ export class Swarm {
     if (merged) {
       await this.syncRepo(repo.id);
       setTimeout(() => this.schedule(), 200);
+    }
+  }
+
+  /**
+   * Between syncs, look again at PRs that can merge without anyone's help (QA passed, approved) and take their next
+   * step, so a merge waits on GitHub's checks rather than on the next 45-second sync. One `gh pr view` per PR.
+   */
+  private pollMerges() {
+    const now = Date.now();
+    for (const repo of this.state.repos) {
+      const rt = this.repoRt.get(repo.id);
+      if (!repo.autoMerge || !rt || rt.syncing || rt.merging || now - Math.max(rt.lastSync ?? 0, rt.mergePolledAt ?? 0) < MERGE_POLL_MS) continue;
+      const ready = this.state.qa.filter((q) => q.repoId === repo.id && readyToMerge(q, now)).map((q) => q.prNumber);
+      if (ready.length === 0) continue;
+      rt.mergePolledAt = now;
+      void this.backend
+        .pullsByNumber(repo.fullName, ready)
+        .then((fresh) => {
+          // Fresh data for the board too.
+          rt.pulls = rt.pulls.map((p) => fresh.find((f) => f.number === p.number) ?? p);
+          return this.advanceMerges(repo, fresh, now);
+        })
+        .catch((err) => console.warn(`could not look at ${repo.fullName}'s PRs ready to merge`, err));
     }
   }
 
@@ -1089,7 +1117,7 @@ export class Swarm {
       // checks on the new head decide, as after the office's own branch update. Anything else gets tested too.
       const clean = rec.passedSha ? await this.backend.cleanMergesSince(repo.fullName, pr.number, rec.passedSha, repo.defaultBranch) : null;
       if (clean && clean === pr.headSha) {
-        this.setQa(rec, { passedSha: clean, approvedSha: carryApproval(rec, clean), pendingSince: null, mergeNote: `only clean merges of ${repo.defaultBranch} since QA: no re-test` });
+        this.setQa(rec, { passedSha: clean, approvedSha: carryApproval(rec, clean), pendingSince: null, mergeRetryAt: null, mergeNote: `only clean merges of ${repo.defaultBranch} since QA: no re-test` });
         return false;
       }
       this.setQa(rec, { status: 'queued', round: rec.round + 1, retests: rec.retests + 1, mergeNote: null, pendingSince: null });
@@ -1108,7 +1136,8 @@ export class Swarm {
       this.mergeNote(rec, `updating the branch with ${repo.defaultBranch}`);
       await this.backend.updateBranch(repo.fullName, pr.number);
       const details = await this.backend.prDetails(repo.fullName, pr.number);
-      this.setQa(rec, { passedSha: details.headSha, approvedSha: carryApproval(rec, details.headSha) });
+      // A refusal before the update (often "not up to date") says nothing about the updated branch.
+      this.setQa(rec, { passedSha: details.headSha, approvedSha: carryApproval(rec, details.headSha), mergeRetryAt: null });
       return false;
     }
     if (step.do !== 'merge') return false;
@@ -2030,7 +2059,7 @@ export class Swarm {
     const repo = this.repo(repoId);
     const rec = this.state.qa.find((q) => q.repoId === repo.id && q.prNumber === prNumber);
     if (!rec || rec.status !== 'passed' || !rec.passedSha) throw new HttpError(409, `PR #${prNumber} hasn't passed QA, so there is no QA report to approve yet`);
-    this.setQa(rec, { approvedSha: rec.passedSha, mergeNote: repo.autoMerge ? "approved: merges once GitHub's checks are green" : 'approved' });
+    this.setQa(rec, { approvedSha: rec.passedSha, mergeRetryAt: null, mergeNote: repo.autoMerge ? "approved: merges once GitHub's checks are green" : 'approved' });
     this.toast('success', `👍 Approved PR #${prNumber}${repo.autoMerge ? "; it merges once GitHub's checks are green" : ''}`);
     void this.syncRepo(repo.id);
   }
@@ -2580,6 +2609,7 @@ export class Swarm {
     this.tickUsage();
     this.watchSessions();
     this.releaseStopped();
+    this.pollMerges(); // merging needs no session slot or usage, so it goes on while new work waits
     if (this.officeUpdateTick()) return; // draining for the office's own update
     if (this.limited()) return;
     // Management first: the CEO's jobs are short and shape everyone else's work.

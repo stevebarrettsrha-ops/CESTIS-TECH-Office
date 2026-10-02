@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { carryApproval, CHECKS_ALERT_MS, MAX_MERGE_FIXES, mergeStep, WAITING_FOR_MANAGER, type MergePull, type MergeRecord } from './mergeGate.ts';
+import { carryApproval, CHECKS_ALERT_MS, MAX_MERGE_FIXES, mergeStep, readyToMerge, WAITING_FOR_MANAGER, type MergePull, type MergeRecord } from './mergeGate.ts';
 
 const NOW = 1_800_000_000_000;
 const base = { base: 'main' };
@@ -216,5 +216,22 @@ describe('carryApproval', () => {
   it('never creates an approval or moves a stale one', () => {
     expect(carryApproval({ passedSha: 'a', approvedSha: null }, 'b')).toBeNull();
     expect(carryApproval({ passedSha: 'a', approvedSha: 'older' }, 'b')).toBe('older');
+  });
+});
+
+describe('readyToMerge', () => {
+  const rec = (r: Partial<MergeRecord> & { status?: string } = {}) => ({ ...record(), status: 'passed', ...r });
+
+  it('is a QA-passed, approved PR with no retry pending', () => {
+    expect(readyToMerge(rec(), NOW)).toBe(true);
+    expect(readyToMerge(rec({ mergeRetryAt: NOW - 1 }), NOW)).toBe(true);
+  });
+
+  it('is not one waiting on the manager, on QA, or on a refused merge', () => {
+    expect(readyToMerge(rec({ approvedSha: null }), NOW)).toBe(false);
+    expect(readyToMerge(rec({ approvedSha: 'older' }), NOW)).toBe(false);
+    expect(readyToMerge(rec({ passedSha: null, approvedSha: null }), NOW)).toBe(false);
+    expect(readyToMerge(rec({ status: 'queued' }), NOW)).toBe(false);
+    expect(readyToMerge(rec({ mergeRetryAt: NOW + 60_000 }), NOW)).toBe(false);
   });
 });

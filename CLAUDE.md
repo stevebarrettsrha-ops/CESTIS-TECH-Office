@@ -88,6 +88,7 @@ Server (`server/`, Node + Express 5 + ws, run by tsx in development; esbuild bun
 - `httpError.ts`: `HttpError(status, message)`.
 - `mergeGate.ts`: auto-merge's next step for a QA-passed PR (pure). Nothing merges until the manager has approved QA's
   report on that exact commit (`QaRecord.approvedSha`, **Approve QA** on the board, `POST /api/repos/:repo/pulls/:n/approve`).
+  Approved PRs are polled every `MERGE_POLL_MS` between syncs (`readyToMerge`, `Swarm.pollMerges`).
 - `officeUpdate.ts`: the office's self-update: the drain decision, the launcher contract (IPC, `last-update.json`).
 - `pacing.ts`: pacing new work after Claude's usage warnings: the start/skip decision and the usage state.
 - `metrics.ts`: the work log (`<SWARM_HOME>/events.jsonl`: tasks started, sessions, QA verdicts, merges) and the
