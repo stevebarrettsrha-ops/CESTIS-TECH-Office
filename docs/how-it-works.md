@@ -48,9 +48,9 @@ The phone's **Company** tab shows the week at a glance:
 - **Issue → merged**: the median time from an agent picking an issue up to its pull request merging.
 - **QA pass rate**: the share of QA rounds that passed, and how many rounds each merged pull request took.
 - **Cost per merged PR**: the session cost the agents reported (CEO included), divided by the merges.
-- **Staff time busy**: developer and QA session time over the staff's hours.
+- **Staff time busy**: developer and QA session time over the hours they were on staff while the office was running. Hires count from when they joined, people let go until they left.
 
-The numbers come from the office's work log, `events.jsonl`, which keeps 30 days. Every merge also counts towards the Employee of the Month for each person who helped: the developer who opened it, whoever fixed it and the QA tester.
+The numbers come from the office's work log, `events.jsonl`, which keeps 30 days. Merges the office missed while it was off are picked up on its next sync, however many there were. Every merge also counts towards the Employee of the Month for each person who helped: the developer who opened it, whoever fixed it and the QA tester.
 
 ## QA testers
 

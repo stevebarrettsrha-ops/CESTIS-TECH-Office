@@ -236,6 +236,10 @@ const MAX_PENDING_REQUESTS = 8;
 const MAX_ISSUES_PER_JOB = 12;
 const KEEP_MESSAGES = 200;
 const KEEP_DECIDED_REQUESTS = 40;
+// PRs looked up one by one per sync when the lists leave them out (see unlistedPulls); the rest wait for the next sync.
+const MAX_UNLISTED_LOOKUPS = 10;
+// The work log repeats the headcount this often even when it hasn't changed (see logStaff).
+const STAFF_RELOG_MS = 24 * 60 * 60_000;
 
 const pick = <T>(arr: T[]) => arr[Math.floor(Math.random() * arr.length)];
 const slugify = (s: string) =>
@@ -426,6 +430,7 @@ export class Swarm {
   private clis: CliView[] = []; // coding-agent CLIs found on this machine (detected at startup)
   private work = new WorkLog(EVENTS_FILE); // the history the productivity numbers come from
   private metricsTimer: NodeJS.Timeout | null = null;
+  private staffLogged: { count: number; at: number } | null = null; // the last headcount in the work log (null until start-up)
   private stoppedSince = new Map<string, number>(); // agent id → when it was first seen stopped (see stopped.ts)
 
   constructor(private backend: Backend) {
@@ -442,6 +447,7 @@ export class Swarm {
 
   async init() {
     await this.work.load().catch((err) => console.warn('could not read the work log', err));
+    this.closeLastRun();
     try {
       const raw = await fs.readFile(STATE_FILE, 'utf8');
       const loaded = JSON.parse(raw) as Partial<Persisted>;
@@ -589,7 +595,8 @@ export class Swarm {
         this.broadcast({ type: 'clis', clis });
       })
       .catch((err) => console.warn('could not look for agent CLIs', err));
-    this.save();
+    this.staffLogged = { count: -1, at: 0 };
+    this.save(); // logs the headcount
     setTimeout(() => this.schedule(), 1000);
   }
 
@@ -767,6 +774,30 @@ export class Swarm {
     }, 2000);
   }
 
+  /**
+   * Log the headcount (developers and QA testers) when it changes, and once a day anyway, so the headcount in force at
+   * the start of any window is still in the log after old lines are dropped. Utilization integrates it (metrics.ts).
+   */
+  private logStaff() {
+    if (!this.staffLogged) return; // still starting up
+    const count = this.state.agents.filter((a) => a.role !== 'ceo').length;
+    const now = Date.now();
+    if (count === this.staffLogged.count && now - this.staffLogged.at < STAFF_RELOG_MS) return;
+    this.staffLogged = { count, at: now };
+    this.record({ at: now, kind: 'staff', count });
+  }
+
+  /** A run that ended without a shutdown (a crash, a killed process) left staff on the books: it ended at its last event. */
+  private closeLastRun() {
+    let last: { at: number; count: number } | null = null;
+    let lastAt = 0;
+    for (const e of this.work.events) {
+      lastAt = Math.max(lastAt, e.at);
+      if (e.kind === 'staff' && (!last || e.at >= last.at)) last = e;
+    }
+    if (last && last.count > 0) this.work.add({ at: lastAt, kind: 'staff', count: 0 });
+  }
+
   private metricsNow(): MetricsView {
     return metricsView(this.work.events, Date.now(), this.state.agents.filter((a) => a.role !== 'ceo').length);
   }
@@ -810,6 +841,7 @@ export class Swarm {
   // ---------- persistence ----------
 
   private save() {
+    this.logStaff();
     if (this.saveTimer) return;
     this.saveTimer = setTimeout(() => void this.writeState().catch((err) => console.warn('could not save the state', err)), 1500);
   }
@@ -1169,6 +1201,7 @@ export class Swarm {
    */
   async shutdown(restart = false): Promise<void> {
     await this.writeState().catch((err) => console.warn('could not save the state', err));
+    if (this.staffLogged) this.work.add({ at: Date.now(), kind: 'staff', count: 0 }); // the office is off: nobody is available
     await this.work.flush();
     await this.backend.releaseClis(restart); // before the terminals are saved: whatever they print next waits in the keeper
     await this.saveTerminals(true);
@@ -1207,7 +1240,7 @@ export class Swarm {
       rt.lastSync = Date.now();
       rt.fetchedAt = started;
       rt.syncError = undefined;
-      this.reconcilePulls(repo, pulls);
+      this.reconcilePulls(repo, [...pulls, ...(await this.unlistedPulls(repo, pulls))]);
       // Something was merged since the last look (by the office or anyone else): bring the folder up to date.
       const newest = pulls.reduce<string | null>((m, p) => (p.mergedAt && (!m || p.mergedAt > m) ? p.mergedAt : m), null);
       if (newest !== rt.lastMergedAt) {
@@ -1221,6 +1254,21 @@ export class Swarm {
       rt.syncing = false;
     }
     if (this.repoRt.has(id)) this.emitRepo(repo);
+  }
+
+  /**
+   * PRs the office still tracks (a QA record, or an agent's desk) that the lists left out: merged before the newest
+   * eight, say while the office was off, or closed without merging. Looked up one by one, a few per sync, so their
+   * merges are logged and credited and their records cleared.
+   */
+  private async unlistedPulls(repo: PersistedRepo, listed: PullInfo[]): Promise<PullInfo[]> {
+    const seen = new Set(listed.map((p) => p.number));
+    const tracked = [
+      ...this.state.qa.filter((q) => q.repoId === repo.id).map((q) => q.prNumber),
+      ...this.state.agents.filter((a) => a.repoId === repo.id && a.prNumber != null).map((a) => a.prNumber!),
+    ];
+    const missing = [...new Set(tracked)].filter((n) => !seen.has(n)).slice(0, MAX_UNLISTED_LOOKUPS);
+    return missing.length ? this.backend.pullsByNumber(repo.fullName, missing).catch(() => []) : [];
   }
 
   /** Keep agents and QA records in step with what happened to PRs on GitHub. */

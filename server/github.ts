@@ -114,6 +114,15 @@ export async function listPulls(fullName: string): Promise<PullInfo[]> {
   return [...open, ...merged].map(toPull);
 }
 
+/**
+ * These PRs, whatever their state: the ones the office still tracks that listPulls left out (merged before the newest
+ * eight, closed without merging). One that can't be read is skipped and asked about again on the next sync.
+ */
+export async function pullsByNumber(fullName: string, numbers: number[]): Promise<PullInfo[]> {
+  const found = await Promise.all(numbers.map((n) => ghJson<RawPull>(['pr', 'view', String(n), '-R', fullName, '--json', PR_FIELDS]).then(toPull, () => null)));
+  return found.filter((p): p is PullInfo => p !== null);
+}
+
 // swarm:<specialty> labels route issues to specialists. gh refuses unknown labels, so they're created on first use.
 const labelsMade = new Set<string>();
 

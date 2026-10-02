@@ -16,6 +16,8 @@ export interface Backend {
   repoMeta(fullName: string): Promise<github.RepoMeta>;
   listIssues(fullName: string): Promise<IssueInfo[]>;
   listPulls(fullName: string): Promise<PullInfo[]>;
+  /** These PRs whatever their state, for ones listPulls leaves out (it lists open PRs and only the newest merges). */
+  pullsByNumber(fullName: string, numbers: number[]): Promise<PullInfo[]>;
   createIssue(fullName: string, title: string, body: string, labels?: string[]): Promise<number>;
   /** OPEN or CLOSED; null when there is no such issue. */
   issueState(fullName: string, number: number): Promise<'OPEN' | 'CLOSED' | null>;
@@ -70,6 +72,7 @@ export const realBackend: Backend = {
   repoMeta: github.repoMeta,
   listIssues: github.listIssues,
   listPulls: github.listPulls,
+  pullsByNumber: github.pullsByNumber,
   createIssue: github.createIssue,
   issueState: github.issueState,
   editIssue: github.editIssue,

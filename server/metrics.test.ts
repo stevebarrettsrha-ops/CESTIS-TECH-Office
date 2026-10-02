@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { KEEP_MS, metricsView, metricsWindow, parseLog, WorkLog, type WorkEvent } from './metrics.ts';
+import { KEEP_MS, metricsView, metricsWindow, parseLog, staffTime, WorkLog, type WorkEvent } from './metrics.ts';
 
 const NOW = new Date(2026, 9, 2, 12, 0).getTime();
 const MIN = 60_000;
@@ -12,6 +12,7 @@ const DAY = 24 * HOUR;
 const start = (at: number, issue: number, repoId = 'o/r'): WorkEvent => ({ at, kind: 'start', repoId, agentId: 'ada', task: 'issue', issue, pr: null });
 const session = (at: number, ms: number, costUsd = 0, repoId = 'o/r'): WorkEvent => ({ at, kind: 'session', repoId, agentId: 'ada', task: 'issue', ms, costUsd, ok: true });
 const verdict = (at: number, pass: boolean): WorkEvent => ({ at, kind: 'verdict', repoId: 'o/r', agentId: 'poirot', pr: 1, round: 1, pass });
+const staff = (at: number, count: number): WorkEvent => ({ at, kind: 'staff', count });
 const merged = (at: number, pr: number, issue: number | null, over: Partial<Extract<WorkEvent, { kind: 'merged' }>> = {}): WorkEvent => ({
   at,
   kind: 'merged',
@@ -85,6 +86,47 @@ describe('metricsWindow', () => {
   });
 });
 
+describe('staffTime', () => {
+  const T0 = NOW - 4 * HOUR;
+
+  it('counts a hire from when they joined', () => {
+    const events = [staff(T0, 1), staff(T0 + 2 * HOUR, 2)];
+    expect(staffTime(events, NOW - DAY, NOW, 99)).toBe(1 * 2 * HOUR + 2 * 2 * HOUR);
+  });
+
+  it('counts someone let go until they left', () => {
+    const events = [staff(T0, 3), staff(T0 + HOUR, 1)];
+    expect(staffTime(events, NOW - DAY, NOW, 99)).toBe(3 * HOUR + 1 * 3 * HOUR);
+  });
+
+  it('does not count time the office was off', () => {
+    const events = [staff(T0, 2), staff(T0 + HOUR, 0), staff(T0 + 3 * HOUR, 2)];
+    expect(staffTime(events, NOW - DAY, NOW, 99)).toBe(2 * HOUR + 0 + 2 * HOUR);
+  });
+
+  it('starts at the window, carrying in the headcount from before it', () => {
+    const events = [staff(NOW - 3 * DAY, 4), staff(NOW - 2 * HOUR, 1)];
+    expect(staffTime(events, NOW - DAY, NOW, 99)).toBe(4 * (DAY - 2 * HOUR) + 1 * 2 * HOUR);
+  });
+
+  it('starts when the log began, assuming the first headcount until it was logged, and ignores later ones', () => {
+    const events = [start(T0, 1), staff(T0 + HOUR, 2), staff(NOW + HOUR, 9)];
+    expect(staffTime(events, NOW - DAY, NOW, 99)).toBe(2 * 4 * HOUR);
+  });
+
+  it('uses the current headcount for a log without headcounts, and nothing for an empty log', () => {
+    expect(staffTime([start(T0, 1)], NOW - DAY, NOW, 3)).toBe(3 * 4 * HOUR);
+    expect(staffTime([], NOW - DAY, NOW, 3)).toBe(0);
+  });
+
+  it('feeds utilization: a hire mid-window does not water it down', () => {
+    // One developer busy 2h of the first 2h; a second hired at T0+2h, both busy for the last 2h: fully used.
+    const events = [staff(T0, 1), session(T0 + 2 * HOUR, 2 * HOUR), staff(T0 + 2 * HOUR, 2), session(NOW, 2 * HOUR), session(NOW, 2 * HOUR)];
+    expect(metricsWindow(events, NOW, DAY, 2).utilization).toBe(1);
+    // Counted with today's headcount over the whole span it would read 6h / 8h.
+  });
+});
+
 describe('metricsView', () => {
   it('gives the daily rate over the week, counting a young log as one day', () => {
     const young = [merged(NOW - 2 * HOUR, 1, null), merged(NOW - HOUR, 2, null), merged(NOW - MIN, 3, null)];
@@ -96,6 +138,10 @@ describe('metricsView', () => {
 });
 
 describe('parseLog', () => {
+  it('reads headcounts', () => {
+    expect(parseLog(JSON.stringify(staff(NOW - HOUR, 3)), NOW).events).toEqual([staff(NOW - HOUR, 3)]);
+  });
+
   it('skips damaged lines and events past KEEP_MS, and sorts by time', () => {
     const text = [JSON.stringify(merged(NOW - HOUR, 2, null)), '{"at": 1, "kind": "merg', JSON.stringify(start(NOW - KEEP_MS - 1, 1)), '', JSON.stringify(start(NOW - 2 * HOUR, 5)), '{"kind":"unknown","at":5}'].join('\n');
     const { events, dropped } = parseLog(text, NOW);

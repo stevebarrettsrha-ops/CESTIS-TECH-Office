@@ -3,7 +3,8 @@ import path from 'node:path';
 import type { AgentTask, MetricsView, MetricsWindow } from '../shared/types.ts';
 
 // The office's work log: one JSON line per thing that happens to a piece of work (picked up, a session ended, a QA
-// verdict, a merge), appended to <SWARM_HOME>/events.jsonl. The productivity numbers on the phone come from it.
+// verdict, a merge) and per change of headcount, appended to <SWARM_HOME>/events.jsonl. The productivity numbers on
+// the phone come from it.
 // State.json only holds the present; this keeps the history that throughput, cycle time and QA pass rate need.
 
 export type WorkEvent =
@@ -13,7 +14,9 @@ export type WorkEvent =
   | { at: number; kind: 'session'; repoId: string; agentId: string; task: AgentTask | null; ms: number; costUsd: number; ok: boolean }
   | { at: number; kind: 'verdict'; repoId: string; agentId: string; pr: number; round: number; pass: boolean }
   /** A swarm PR merged. credited: the agents whose Employee of the Month count it raised. */
-  | { at: number; kind: 'merged'; repoId: string; pr: number; issue: number | null; credited: string[]; qaRounds: number; mergeFixes: number; openedAt: number | null };
+  | { at: number; kind: 'merged'; repoId: string; pr: number; issue: number | null; credited: string[]; qaRounds: number; mergeFixes: number; openedAt: number | null }
+  /** Developers and QA testers on staff from now on: logged when it changes, at start-up, and as 0 while the office is off. */
+  | { at: number; kind: 'staff'; count: number };
 
 /** Events older than this are dropped when the log loads. */
 export const KEEP_MS = 30 * 24 * 60 * 60_000;
@@ -21,7 +24,7 @@ const HOUR = 60 * 60_000;
 const DAY = 24 * HOUR;
 
 const isEvent = (e: unknown): e is WorkEvent =>
-  !!e && typeof e === 'object' && typeof (e as WorkEvent).at === 'number' && ['start', 'session', 'verdict', 'merged'].includes((e as WorkEvent).kind);
+  !!e && typeof e === 'object' && typeof (e as WorkEvent).at === 'number' && ['start', 'session', 'verdict', 'merged', 'staff'].includes((e as WorkEvent).kind);
 
 /** Parse the log's lines, skipping damaged ones (a crash mid-append) and anything older than `KEEP_MS`. */
 export function parseLog(text: string, now: number): { events: WorkEvent[]; dropped: number } {
@@ -51,9 +54,37 @@ const median = (xs: number[]) => {
 
 const round = (x: number, places: number) => Math.round(x * 10 ** places) / 10 ** places;
 
+/** When the log began (events can be logged out of order, e.g. a merge at GitHub's merge time). */
+const firstAt = (events: WorkEvent[]) => (events.length ? events.reduce((m, e) => Math.min(m, e.at), Infinity) : null);
+
 /**
- * The numbers for one window ending now. `staff` is the developer and QA headcount, for utilization. A window longer
- * than the log only counts the time the log covers, so a new office isn't shown as idle for the days before it existed.
+ * Staff time available between `from` and `now` (ms × people): the headcount logged over time, counted from when the
+ * log began, so hires count from when they joined, let-gos until they left, and time the office was off not at all.
+ * Before the first logged headcount, that one is assumed; a log with none (from before headcounts were logged) uses
+ * `staff` throughout.
+ */
+export function staffTime(events: WorkEvent[], from: number, now: number, staff: number): number {
+  const first = firstAt(events);
+  if (first == null) return 0;
+  let t = Math.max(from, first);
+  const marks = events.filter((e) => e.kind === 'staff').sort((a, b) => a.at - b.at);
+  if (marks.length === 0) return staff * Math.max(0, now - t);
+  let count = marks[0].count;
+  let total = 0;
+  for (const m of marks) {
+    if (m.at >= now) break;
+    if (m.at > t) {
+      total += count * (m.at - t);
+      t = m.at;
+    }
+    count = m.count;
+  }
+  return total + count * Math.max(0, now - t);
+}
+
+/**
+ * The numbers for one window ending now. Utilization is busy time over the staff time available in the window
+ * (staffTime); `staff`, today's developer and QA headcount, only stands in for logs without headcounts.
  */
 export function metricsWindow(events: WorkEvent[], now: number, windowMs: number, staff: number): MetricsWindow {
   const from = now - windowMs;
@@ -82,8 +113,7 @@ export function metricsWindow(events: WorkEvent[], now: number, windowMs: number
     if (!e.repoId) continue; // the CEO isn't floor staff
     busyMs += Math.max(0, Math.min(e.at, now) - Math.max(e.at - e.ms, from)); // the part of the session inside the window
   }
-  const span = events.length ? Math.min(windowMs, now - events[0].at) : 0;
-  const available = staff * span;
+  const available = staffTime(events, from, now, staff);
   const median_ = median(cycles);
 
   return {
@@ -101,7 +131,7 @@ export function metricsWindow(events: WorkEvent[], now: number, windowMs: number
 
 /** The phone's productivity view: the last day, the last week and the week's daily rate. */
 export function metricsView(events: WorkEvent[], now: number, staff: number): MetricsView {
-  const since = events.length ? events[0].at : null;
+  const since = firstAt(events);
   const week = metricsWindow(events, now, 7 * DAY, staff);
   // A log younger than a day still counts as one day, so a fresh office's first merge isn't extrapolated.
   const days = since == null ? 0 : Math.max(1, Math.min(7, (now - since) / DAY));

@@ -421,6 +421,7 @@ export function createDemoBackend(): Backend {
     },
     listIssues: async (fullName) => [...(repos.get(fullName)?.issues ?? [])],
     listPulls: async (fullName) => [...(repos.get(fullName)?.pulls ?? [])],
+    pullsByNumber: async (fullName, numbers) => (repos.get(fullName)?.pulls ?? []).filter((p) => numbers.includes(p.number)),
     createIssue: async (fullName, title, body, labels = []) => {
       const r = repos.get(fullName);
       if (!r) throw new Error('Unknown repo');
