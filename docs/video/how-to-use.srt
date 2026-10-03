@@ -1,0 +1,199 @@
+1
+00:00:00,000 --> 00:00:03,648
+Welcome to C.E.S.T.I.S Office, from C.E.S.T.I.S Technical Services.
+
+2
+00:00:04,098 --> 00:00:09,922
+It's a cartoon 3D office where a team of AI coding agents works through your GitHub issues.
+
+3
+00:00:10,372 --> 00:00:17,071
+Developers write the code, QA testers check every change in a real browser, and a CEO plans the work.
+
+4
+00:00:17,521 --> 00:00:21,489
+You walk around, watch them work, and stay in charge of what gets merged.
+
+5
+00:00:21,939 --> 00:00:24,968
+This video shows you how to use it, from start to finish.
+
+6
+00:00:25,869 --> 00:00:34,168
+You need Node.js 22 or newer, git, the GitHub CLI signed in with gh auth login, and a Claude subscription.
+
+7
+00:00:34,618 --> 00:00:39,546
+Clone the repository, then run npm install and npm run build.
+
+8
+00:00:39,996 --> 00:00:47,292
+Try the demo first with npm run demo. It fakes GitHub and the agents, so it costs nothing and changes nothing.
+
+9
+00:00:47,742 --> 00:00:50,515
+Everything in this video was recorded in the demo.
+
+10
+00:00:50,965 --> 00:00:57,237
+For real work, sign Claude in once with login, check your machine with doctor, then run npm start.
+
+11
+00:00:58,138 --> 00:01:02,767
+The start screen shows whether you're in demo mode. Press Enter the office to walk in.
+
+12
+00:01:03,217 --> 00:01:09,127
+The first time, a short setup asks your name and introduces your CEO, and a tour shows you around.
+
+13
+00:01:09,577 --> 00:01:11,219
+You can skip the tour at any time.
+
+14
+00:01:13,590 --> 00:01:19,713
+You start in the lobby. Move with W, A, S and D or the arrow keys, and hold Shift to run.
+
+15
+00:01:20,163 --> 00:01:24,280
+Click the view to look around with the mouse, and press Escape to let the mouse go.
+
+16
+00:01:24,730 --> 00:01:31,493
+Press E, or click, to use whatever is under the crosshair: a desk, the whiteboard, the elevator or a computer.
+
+17
+00:01:31,943 --> 00:01:34,247
+Press H at any time for the list of keys.
+
+18
+00:01:37,136 --> 00:01:41,637
+The manager's office is yours. Your computer there is the manager's console.
+
+19
+00:01:42,087 --> 00:01:46,823
+The Employee of the Month board shows whoever has helped merge the most pull requests.
+
+20
+00:01:47,273 --> 00:01:55,103
+Across the lobby is the CEO's corner office, and the waiting room, where job candidates wait in their own clothes until they're hired.
+
+21
+00:01:57,265 --> 00:02:04,518
+On the console's Floors tab you connect a GitHub repository or one of your project folders, or start a new blank repo.
+
+22
+00:02:04,968 --> 00:02:12,520
+Each project becomes a floor of the building. Turn on auto-assign, and free developers pick up backlog issues by themselves.
+
+23
+00:02:12,970 --> 00:02:19,562
+Team is where you hire developers and QA testers, rename them, and choose each one's coding agent and model.
+
+24
+00:02:20,012 --> 00:02:27,671
+Settings holds the office-wide choices: the default model, a limit on how many agents work at once, and how hiring works.
+
+25
+00:02:28,572 --> 00:02:32,945
+Press P anywhere to take out your phone. This is how you talk to your CEO.
+
+26
+00:02:33,395 --> 00:02:41,054
+The CEO studies each project, writes its QA checklist, files the work as GitHub issues, and proposes who to hire.
+
+27
+00:02:41,504 --> 00:02:45,771
+Proposals wait in Hires. Read the resume, then approve or decline.
+
+28
+00:02:46,221 --> 00:02:51,597
+Company shows the whole business at a glance: what needs you, and how each project is doing.
+
+29
+00:02:52,047 --> 00:03:01,860
+This week shows productivity: pull requests merged, the time from issue to merge, QA's pass rate, cost per merged pull request, and how busy the staff are.
+
+30
+00:03:02,760 --> 00:03:07,069
+Each floor is one project. Ride the elevator, or press Go on the phone.
+
+31
+00:03:07,519 --> 00:03:11,466
+Your team works at their desks in C.E.S.T.I.S staff shirts and name badges.
+
+32
+00:03:11,916 --> 00:03:14,881
+Press Tab to see who is working right now, and what on.
+
+33
+00:03:25,209 --> 00:03:28,836
+Walk up to a desk and press E to open that agent's terminal.
+
+34
+00:03:29,286 --> 00:03:35,387
+Every agent is a real coding agent running on your machine, in its own copy of the repository.
+
+35
+00:03:35,837 --> 00:03:39,186
+Watch it work live, or type into it to give it instructions.
+
+36
+00:03:39,636 --> 00:03:47,039
+If an agent goes quiet for twenty minutes your phone tells you. After thirty, the office stops it and puts the work back in the queue.
+
+37
+00:03:47,939 --> 00:03:51,182
+The whiteboard is the Kanban board. Press E in front of it.
+
+38
+00:03:51,632 --> 00:03:57,136
+Issues move from the backlog, to in progress, to QA, to ready to merge, and finally to merged.
+
+39
+00:03:57,586 --> 00:04:00,764
+You can file new issues here, and assign them to a developer.
+
+40
+00:04:01,664 --> 00:04:04,053
+Every pull request goes to a QA tester.
+
+41
+00:04:04,503 --> 00:04:13,207
+They review the code, run the tests and the build, and try the change in a real browser, then post a report with screenshots on the pull request.
+
+42
+00:04:13,657 --> 00:04:18,159
+If QA fails it, the developer fixes it, and QA re-tests what changed.
+
+43
+00:04:19,058 --> 00:04:22,578
+When QA passes, nothing merges until you've checked its work.
+
+44
+00:04:23,028 --> 00:04:28,703
+Press Approve QA to read QA's summary and every check it made, with a link to the full report.
+
+45
+00:04:29,153 --> 00:04:35,019
+Once you approve, the office merges it as soon as GitHub's checks are green, and everyone celebrates.
+
+46
+00:04:35,919 --> 00:04:43,556
+Press B for the staff room: everyone's ID card, their shirt, what they're working on, and how many pull requests they've helped merge.
+
+47
+00:04:44,006 --> 00:04:48,017
+Look at someone and press V for a high five, or C to change their shirt.
+
+48
+00:04:48,467 --> 00:04:51,091
+And press J for an office jam, with confetti.
+
+49
+00:04:51,993 --> 00:05:00,910
+That's C.E.S.T.I.S Office: connect a repository, let the CEO plan the work, approve the hires, and check QA's reports before anything merges.
+
+50
+00:05:01,360 --> 00:05:05,520
+The README and the How it works guide have all the details. Happy building!

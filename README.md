@@ -8,6 +8,14 @@ Every person you hire gets a **C.E.S.T.I.S staff shirt** in one of twelve colour
 
 ![The team floor](docs/screenshots/06-team-floor.png)
 
+## Watch how to use it
+
+A five-minute narrated tour, recorded in the demo office: installing it, the controls, the manager's console, the phone and the CEO, watching an agent's terminal, the Kanban board, QA, approving QA's report before a merge, and the staff room.
+
+[![Watch: how to use C.E.S.T.I.S Office](docs/video/how-to-use.jpg)](docs/video/how-to-use.mp4)
+
+[▶ Play the video](docs/video/how-to-use.mp4) (MP4 with sound, 5 minutes, captions burned in) · [captions as text](docs/video/how-to-use.srt)
+
 ## What's in this version
 
 C.E.S.T.I.S Office is built on [cubefarm](https://github.com/leonvanzyl/cubefarm) by Leon van Zyl (MIT licence). It works the same way and adds:
@@ -136,6 +144,7 @@ To make changes and improve it further, see [CONTRIBUTING.md](CONTRIBUTING.md). 
 
 ## Learn more
 
+- [Video tour](docs/video/how-to-use.mp4): five minutes, narrated, covering everything from installing it to merging
 - [How it works](docs/how-it-works.md): the life of an issue, QA, auto-merge, models and usage, the safety model and floor previews
 - [Contributing](CONTRIBUTING.md): run it from source, tests, architecture
 

@@ -1,6 +1,6 @@
 # How C.E.S.T.I.S Office works
 
-The details behind the office: how an issue becomes a merged pull request, who does what, and what agents are allowed to do on your machine. For getting started, see the [README](../README.md).
+The details behind the office: how an issue becomes a merged pull request, who does what, and what agents are allowed to do on your machine. For getting started, see the [README](../README.md), or watch the [five-minute video tour](video/how-to-use.mp4).
 
 ## How an issue flows through the office
 
